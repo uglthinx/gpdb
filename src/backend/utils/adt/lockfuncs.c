@@ -34,6 +34,7 @@ static const char *const LockTagTypeNames[] = {
 	"virtualxid",
 	"append-only segment file",
 	"object",
+	"relation-dml",
 	"resource queue",
 	"userlock",
 	"advisory"
@@ -437,6 +438,17 @@ pg_lock_status(PG_FUNCTION_ARGS)
 				nulls[5] = true;
 				nulls[6] = true;
 				nulls[7] = true;
+				nulls[9] = true;
+				break;
+			case LOCKTAG_RELATION_DML:
+				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
+				values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+				nulls[3] = true;
+				nulls[4] = true;
+				nulls[5] = true;
+				nulls[6] = true;
+				nulls[7] = true;
+				nulls[8] = true;
 				nulls[9] = true;
 				break;
 			case LOCKTAG_OBJECT:

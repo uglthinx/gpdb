@@ -1,0 +1,1397 @@
+-- This test script contains 21 blocks, it loops each possible sitution
+-- for the concurrence of DMLs in Greenplum DB.
+
+-- Some DMLs (like splitupdate, update/delete whose
+-- plans contains Motion) cannot be concurrently executed.
+-- This commit uses a new type of Lock to serialize these
+-- DMLs execution on QD.
+
+-- DMLs can be grouped into six class:
+--   c1. normal update (update statement whose plan contains no motion)
+--   c2. normal delete (delete statement whose plan contains no motion)
+--   c3. split-update (update statement on hash cols of hash-distributed table)
+--   c4. update whose plan has motions (like update t1 set c = c + 1 from t2 where ...)
+--   c5. delete whose plan has motions (like delete from t1 using t2 where t1.c = t2.c)
+
+-- If these operations are on the same table, the conflict relation among them
+-- should be:
+
+-- c1 conflict with [c3, c4, c5]
+-- c2 conflict with [c3]
+-- c3 conflict with [c1, c2, c3, c4, c5]
+-- c4 conflict with [c1, c3, c4, c5]
+-- c5 conflict with [c1, c3, c4]
+-- So the lockmode for these five operations can be:
+--   c1 ---- RowExclusiveLock
+--   c2 ---- RowShareLock
+--   c3 ---- ExclusiveLock
+--   c4 ---- ShareRowExclusiveLock
+--   c5 ---- ShareLock
+
+
+-- Test two operations on same table should be serialized on QD: normal update, split-update
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: update t_concurrent_dmls set c2 = 999 where c2 = 1;
+UPDATE 1
+2&: update t_concurrent_dmls set c1 = 888 where c1 = 1;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode             | granted 
+---------------+--------------+-------------------+------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowExclusiveLock | t       
+ -1            | relation-dml | t_concurrent_dmls | ExclusiveLock    | f       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 1
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1  | c2  | c3 
+-----+-----+----
+ 2   | 2   | 2  
+ 5   | 5   | 5  
+ 6   | 6   | 6  
+ 9   | 9   | 9  
+ 10  | 10  | 10 
+ 12  | 12  | 12 
+ 16  | 16  | 16 
+ 20  | 20  | 20 
+ 3   | 3   | 3  
+ 13  | 13  | 13 
+ 14  | 14  | 14 
+ 15  | 15  | 15 
+ 19  | 19  | 19 
+ 4   | 4   | 4  
+ 7   | 7   | 7  
+ 8   | 8   | 8  
+ 11  | 11  | 11 
+ 17  | 17  | 17 
+ 18  | 18  | 18 
+ 888 | 999 | 1  
+(20 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table should be serialized on QD: normal update, update whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: update t_concurrent_dmls set c2 = 777 from t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+UPDATE 2
+2&: update t_concurrent_dmls set c2 = 999 where c2 = 1;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode                  | granted 
+---------------+--------------+-------------------+-----------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowExclusiveLock      | f       
+ -1            | relation-dml | t_concurrent_dmls | ShareRowExclusiveLock | t       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 0
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2  | c3 
+----+-----+----
+ 3  | 3   | 3  
+ 13 | 13  | 13 
+ 14 | 14  | 14 
+ 15 | 15  | 15 
+ 19 | 19  | 19 
+ 1  | 777 | 1  
+ 5  | 5   | 5  
+ 6  | 6   | 6  
+ 9  | 9   | 9  
+ 10 | 10  | 10 
+ 12 | 12  | 12 
+ 16 | 16  | 16 
+ 20 | 20  | 20 
+ 2  | 777 | 2  
+ 4  | 4   | 4  
+ 7  | 7   | 7  
+ 8  | 8   | 8  
+ 11 | 11  | 11 
+ 17 | 17  | 17 
+ 18 | 18  | 18 
+(20 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 1  | 1  | 1  
+ 2  | 2  | 2  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table should be serialized on QD: normal update, delete whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls using t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+DELETE 2
+2&: update t_concurrent_dmls set c2 = 999 where c2 = 1;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode             | granted 
+---------------+--------------+-------------------+------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ShareLock        | t       
+ -1            | relation-dml | t_concurrent_dmls | RowExclusiveLock | f       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 0
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 17 | 17 | 17 
+ 18 | 18 | 18 
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 12 | 12 | 12 
+ 16 | 16 | 16 
+ 20 | 20 | 20 
+ 3  | 3  | 3  
+ 13 | 13 | 13 
+ 14 | 14 | 14 
+ 15 | 15 | 15 
+ 19 | 19 | 19 
+(18 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 2  | 2  | 2  
+ 1  | 1  | 1  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table should be serialized on QD: normal delete, split-update
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls where c2 = 1;
+DELETE 1
+2&: update t_concurrent_dmls set c1 = 888 where c1 = 1;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode          | granted 
+---------------+--------------+-------------------+---------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ExclusiveLock | f       
+ -1            | relation-dml | t_concurrent_dmls | RowShareLock  | t       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 0
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 17 | 17 | 17 
+ 18 | 18 | 18 
+ 2  | 2  | 2  
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 12 | 12 | 12 
+ 16 | 16 | 16 
+ 20 | 20 | 20 
+ 3  | 3  | 3  
+ 13 | 13 | 13 
+ 14 | 14 | 14 
+ 15 | 15 | 15 
+ 19 | 19 | 19 
+(19 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table should be serialized on QD: split-update, split-update
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: update t_concurrent_dmls set c1 = 888 where c1 = 1;
+UPDATE 1
+2&: update t_concurrent_dmls set c1 = 888 where c1 = 1;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode          | granted 
+---------------+--------------+-------------------+---------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ExclusiveLock | f       
+ -1            | relation-dml | t_concurrent_dmls | ExclusiveLock | t       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 0
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1  | c2 | c3 
+-----+----+----
+ 4   | 4  | 4  
+ 7   | 7  | 7  
+ 8   | 8  | 8  
+ 11  | 11 | 11 
+ 17  | 17 | 17 
+ 18  | 18 | 18 
+ 888 | 1  | 1  
+ 3   | 3  | 3  
+ 13  | 13 | 13 
+ 14  | 14 | 14 
+ 15  | 15 | 15 
+ 19  | 19 | 19 
+ 2   | 2  | 2  
+ 5   | 5  | 5  
+ 6   | 6  | 6  
+ 9   | 9  | 9  
+ 10  | 10 | 10 
+ 12  | 12 | 12 
+ 16  | 16 | 16 
+ 20  | 20 | 20 
+(20 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table should be serialized on QD: split-update, update whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: update t_concurrent_dmls set c2 = 777 from t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+UPDATE 2
+2&: update t_concurrent_dmls set c1 = 888 where c1 = 1;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode                  | granted 
+---------------+--------------+-------------------+-----------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ExclusiveLock         | f       
+ -1            | relation-dml | t_concurrent_dmls | ShareRowExclusiveLock | t       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 1
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1  | c2  | c3 
+-----+-----+----
+ 4   | 4   | 4  
+ 7   | 7   | 7  
+ 8   | 8   | 8  
+ 11  | 11  | 11 
+ 17  | 17  | 17 
+ 18  | 18  | 18 
+ 888 | 777 | 1  
+ 5   | 5   | 5  
+ 6   | 6   | 6  
+ 9   | 9   | 9  
+ 10  | 10  | 10 
+ 12  | 12  | 12 
+ 16  | 16  | 16 
+ 20  | 20  | 20 
+ 2   | 777 | 2  
+ 3   | 3   | 3  
+ 13  | 13  | 13 
+ 14  | 14  | 14 
+ 15  | 15  | 15 
+ 19  | 19  | 19 
+(20 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 1  | 1  | 1  
+ 2  | 2  | 2  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table should be serialized on QD: split-update, delete whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls using t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+DELETE 2
+2&: update t_concurrent_dmls set c1 = 888 where c1 = 1;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode          | granted 
+---------------+--------------+-------------------+---------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ExclusiveLock | f       
+ -1            | relation-dml | t_concurrent_dmls | ShareLock     | t       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 0
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 17 | 17 | 17 
+ 18 | 18 | 18 
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 12 | 12 | 12 
+ 16 | 16 | 16 
+ 20 | 20 | 20 
+ 3  | 3  | 3  
+ 13 | 13 | 13 
+ 14 | 14 | 14 
+ 15 | 15 | 15 
+ 19 | 19 | 19 
+(18 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 1  | 1  | 1  
+ 2  | 2  | 2  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table should be serialized on QD: update whose plan contains motion, update whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: update t_concurrent_dmls set c2 = 777 from t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+UPDATE 2
+2&: update t_concurrent_dmls set c2 = 777 from t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode                  | granted 
+---------------+--------------+-------------------+-----------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ShareRowExclusiveLock | f       
+ -1            | relation-dml | t_concurrent_dmls | ShareRowExclusiveLock | t       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 2
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2  | c3 
+----+-----+----
+ 5  | 5   | 5  
+ 6  | 6   | 6  
+ 9  | 9   | 9  
+ 10 | 10  | 10 
+ 12 | 12  | 12 
+ 16 | 16  | 16 
+ 20 | 20  | 20 
+ 2  | 777 | 2  
+ 4  | 4   | 4  
+ 7  | 7   | 7  
+ 8  | 8   | 8  
+ 11 | 11  | 11 
+ 17 | 17  | 17 
+ 18 | 18  | 18 
+ 3  | 3   | 3  
+ 13 | 13  | 13 
+ 14 | 14  | 14 
+ 15 | 15  | 15 
+ 19 | 19  | 19 
+ 1  | 777 | 1  
+(20 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 2  | 2  | 2  
+ 1  | 1  | 1  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table should be serialized on QD: update whose plan contains motion, delete whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls using t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+DELETE 2
+2&: update t_concurrent_dmls set c2 = 777 from t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;  <waiting ...>
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode                  | granted 
+---------------+--------------+-------------------+-----------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ShareRowExclusiveLock | f       
+ -1            | relation-dml | t_concurrent_dmls | ShareLock             | t       
+(2 rows)
+
+1: end;
+END
+2<:  <... completed>
+UPDATE 0
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 12 | 12 | 12 
+ 16 | 16 | 16 
+ 20 | 20 | 20 
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 17 | 17 | 17 
+ 18 | 18 | 18 
+ 3  | 3  | 3  
+ 13 | 13 | 13 
+ 14 | 14 | 14 
+ 15 | 15 | 15 
+ 19 | 19 | 19 
+(18 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 1  | 1  | 1  
+ 2  | 2  | 2  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: normal update, normal update
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: update t_concurrent_dmls set c2 = 999 where c2 = 1;
+UPDATE 1
+2: update t_concurrent_dmls set c2 =666 where c2 = 2;
+UPDATE 1
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode             | granted 
+---------------+--------------+-------------------+------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowExclusiveLock | t       
+ -1            | relation-dml | t_concurrent_dmls | RowExclusiveLock | t       
+(2 rows)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2  | c3 
+----+-----+----
+ 3  | 3   | 3  
+ 13 | 13  | 13 
+ 14 | 14  | 14 
+ 15 | 15  | 15 
+ 19 | 19  | 19 
+ 1  | 999 | 1  
+ 4  | 4   | 4  
+ 7  | 7   | 7  
+ 8  | 8   | 8  
+ 11 | 11  | 11 
+ 17 | 17  | 17 
+ 18 | 18  | 18 
+ 5  | 5   | 5  
+ 6  | 6   | 6  
+ 9  | 9   | 9  
+ 10 | 10  | 10 
+ 12 | 12  | 12 
+ 16 | 16  | 16 
+ 20 | 20  | 20 
+ 2  | 666 | 2  
+(20 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: normal update, insert
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: insert into t_concurrent_dmls select * from generate_series(1, 5);
+INSERT 5
+2: update t_concurrent_dmls set c2 =666 where c2 = 2;
+UPDATE 1
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode             | granted 
+---------------+--------------+-------------------+------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowExclusiveLock | t       
+(1 row)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2  | c3 
+----+-----+----
+ 5  | 5   | 5  
+ 6  | 6   | 6  
+ 9  | 9   | 9  
+ 10 | 10  | 10 
+ 12 | 12  | 12 
+ 16 | 16  | 16 
+ 20 | 20  | 20 
+ 2  |     |    
+ 5  |     |    
+ 2  | 666 | 2  
+ 1  | 1   | 1  
+ 3  | 3   | 3  
+ 13 | 13  | 13 
+ 14 | 14  | 14 
+ 15 | 15  | 15 
+ 19 | 19  | 19 
+ 1  |     |    
+ 3  |     |    
+ 4  | 4   | 4  
+ 7  | 7   | 7  
+ 8  | 8   | 8  
+ 11 | 11  | 11 
+ 17 | 17  | 17 
+ 18 | 18  | 18 
+ 4  |     |    
+(25 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: normal update, normal delete
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls where c2 = 1;
+DELETE 1
+2: update t_concurrent_dmls set c2 =666 where c2 = 2;
+UPDATE 1
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode             | granted 
+---------------+--------------+-------------------+------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowShareLock     | t       
+ -1            | relation-dml | t_concurrent_dmls | RowExclusiveLock | t       
+(2 rows)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2  | c3 
+----+-----+----
+ 4  | 4   | 4  
+ 7  | 7   | 7  
+ 8  | 8   | 8  
+ 11 | 11  | 11 
+ 17 | 17  | 17 
+ 18 | 18  | 18 
+ 5  | 5   | 5  
+ 6  | 6   | 6  
+ 9  | 9   | 9  
+ 10 | 10  | 10 
+ 12 | 12  | 12 
+ 16 | 16  | 16 
+ 20 | 20  | 20 
+ 2  | 666 | 2  
+ 3  | 3   | 3  
+ 13 | 13  | 13 
+ 14 | 14  | 14 
+ 15 | 15  | 15 
+ 19 | 19  | 19 
+(19 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: normal delete, normal delete
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls where c2 = 1;
+DELETE 1
+2: delete from t_concurrent_dmls where c2 = 2;
+DELETE 1
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode         | granted 
+---------------+--------------+-------------------+--------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowShareLock | t       
+ -1            | relation-dml | t_concurrent_dmls | RowShareLock | t       
+(2 rows)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 12 | 12 | 12 
+ 16 | 16 | 16 
+ 20 | 20 | 20 
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 17 | 17 | 17 
+ 18 | 18 | 18 
+ 3  | 3  | 3  
+ 13 | 13 | 13 
+ 14 | 14 | 14 
+ 15 | 15 | 15 
+ 19 | 19 | 19 
+(18 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: normal delete, insert
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls where c2 = 1;
+DELETE 1
+2: insert into t_concurrent_dmls select * from generate_series(1, 5);
+INSERT 5
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode         | granted 
+---------------+--------------+-------------------+--------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowShareLock | t       
+(1 row)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 17 | 17 | 17 
+ 18 | 18 | 18 
+ 4  |    |    
+ 2  | 2  | 2  
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 12 | 12 | 12 
+ 16 | 16 | 16 
+ 20 | 20 | 20 
+ 2  |    |    
+ 5  |    |    
+ 3  | 3  | 3  
+ 13 | 13 | 13 
+ 14 | 14 | 14 
+ 15 | 15 | 15 
+ 19 | 19 | 19 
+ 1  |    |    
+ 3  |    |    
+(24 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: normal delete, delete whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls where c2 = 1;
+DELETE 1
+2: delete from t_concurrent_dmls using t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 > t_concurrent_dmls_auxiliary.c3 + 10;
+DELETE 9
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode         | granted 
+---------------+--------------+-------------------+--------------+---------
+ -1            | relation-dml | t_concurrent_dmls | RowShareLock | t       
+ -1            | relation-dml | t_concurrent_dmls | ShareLock    | t       
+(2 rows)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 3  | 3  | 3  
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 2  | 2  | 2  
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+(10 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 2  | 2  | 2  
+ 1  | 1  | 1  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: normal delete, update whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls where c2 = 9;
+DELETE 1
+2: update t_concurrent_dmls set c2 = 777 from t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+UPDATE 2
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode                  | granted 
+---------------+--------------+-------------------+-----------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ShareRowExclusiveLock | t       
+ -1            | relation-dml | t_concurrent_dmls | RowShareLock          | t       
+(2 rows)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2  | c3 
+----+-----+----
+ 5  | 5   | 5  
+ 6  | 6   | 6  
+ 10 | 10  | 10 
+ 12 | 12  | 12 
+ 16 | 16  | 16 
+ 20 | 20  | 20 
+ 2  | 777 | 2  
+ 3  | 3   | 3  
+ 13 | 13  | 13 
+ 14 | 14  | 14 
+ 15 | 15  | 15 
+ 19 | 19  | 19 
+ 1  | 777 | 1  
+ 4  | 4   | 4  
+ 7  | 7   | 7  
+ 8  | 8   | 8  
+ 11 | 11  | 11 
+ 17 | 17  | 17 
+ 18 | 18  | 18 
+(19 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 2  | 2  | 2  
+ 1  | 1  | 1  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: split-update, insert
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: insert into t_concurrent_dmls select * from generate_series(1, 5);
+INSERT 5
+2: update t_concurrent_dmls set c1 = 888 where c1 = 1;
+UPDATE 1
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode          | granted 
+---------------+--------------+-------------------+---------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ExclusiveLock | t       
+(1 row)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1  | c2 | c3 
+-----+----+----
+ 4   | 4  | 4  
+ 7   | 7  | 7  
+ 8   | 8  | 8  
+ 11  | 11 | 11 
+ 17  | 17 | 17 
+ 18  | 18 | 18 
+ 4   |    |    
+ 888 | 1  | 1  
+ 2   | 2  | 2  
+ 5   | 5  | 5  
+ 6   | 6  | 6  
+ 9   | 9  | 9  
+ 10  | 10 | 10 
+ 12  | 12 | 12 
+ 16  | 16 | 16 
+ 20  | 20 | 20 
+ 2   |    |    
+ 5   |    |    
+ 3   | 3  | 3  
+ 13  | 13 | 13 
+ 14  | 14 | 14 
+ 15  | 15 | 15 
+ 19  | 19 | 19 
+ 1   |    |    
+ 3   |    |    
+(25 rows)
+
+drop table t_concurrent_dmls;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: update whose plan contains motion, insert
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: insert into t_concurrent_dmls select * from generate_series(1, 5);
+INSERT 5
+2: update t_concurrent_dmls set c2 = 777 from t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+UPDATE 2
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode                  | granted 
+---------------+--------------+-------------------+-----------------------+---------
+ -1            | relation-dml | t_concurrent_dmls | ShareRowExclusiveLock | t       
+(1 row)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2  | c3 
+----+-----+----
+ 4  | 4   | 4  
+ 7  | 7   | 7  
+ 8  | 8   | 8  
+ 11 | 11  | 11 
+ 17 | 17  | 17 
+ 18 | 18  | 18 
+ 4  |     |    
+ 5  | 5   | 5  
+ 6  | 6   | 6  
+ 9  | 9   | 9  
+ 10 | 10  | 10 
+ 12 | 12  | 12 
+ 16 | 16  | 16 
+ 20 | 20  | 20 
+ 2  |     |    
+ 5  |     |    
+ 2  | 777 | 2  
+ 3  | 3   | 3  
+ 13 | 13  | 13 
+ 14 | 14  | 14 
+ 15 | 15  | 15 
+ 19 | 19  | 19 
+ 1  |     |    
+ 3  |     |    
+ 1  | 777 | 1  
+(25 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 2  | 2  | 2  
+ 1  | 1  | 1  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: delete whose plan contains motion, delete whose plan contains motion
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: delete from t_concurrent_dmls using t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 = t_concurrent_dmls_auxiliary.c3;
+DELETE 2
+2: delete from t_concurrent_dmls using t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 > t_concurrent_dmls_auxiliary.c3 + 10;
+DELETE 9
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode      | granted 
+---------------+--------------+-------------------+-----------+---------
+ -1            | relation-dml | t_concurrent_dmls | ShareLock | t       
+ -1            | relation-dml | t_concurrent_dmls | ShareLock | t       
+(2 rows)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 3  | 3  | 3  
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+(9 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 1  | 1  | 1  
+ 2  | 2  | 2  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: delete whose plan contains motion, insert
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+create table t_concurrent_dmls_auxiliary(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+insert into t_concurrent_dmls_auxiliary select i,i,i from generate_series(1, 2)i;
+INSERT 2
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: insert into t_concurrent_dmls select * from generate_series(1, 5);
+INSERT 5
+2: delete from t_concurrent_dmls using t_concurrent_dmls_auxiliary where t_concurrent_dmls.c3 > t_concurrent_dmls_auxiliary.c3 + 10;
+DELETE 9
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype     | relation          | mode      | granted 
+---------------+--------------+-------------------+-----------+---------
+ -1            | relation-dml | t_concurrent_dmls | ShareLock | t       
+(1 row)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 2  | 2  | 2  
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 2  |    |    
+ 5  |    |    
+ 1  | 1  | 1  
+ 3  | 3  | 3  
+ 1  |    |    
+ 3  |    |    
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 4  |    |    
+(16 rows)
+select * from t_concurrent_dmls_auxiliary;
+ c1 | c2 | c3 
+----+----+----
+ 2  | 2  | 2  
+ 1  | 1  | 1  
+(2 rows)
+
+drop table t_concurrent_dmls;
+DROP
+drop table t_concurrent_dmls_auxiliary;
+DROP
+
+-- Test two operations on same table can be concurrent on QD: insert, insert
+create table t_concurrent_dmls(c1 int, c2 int, c3 int) distributed by (c1);
+CREATE
+insert into t_concurrent_dmls select i,i,i from generate_series(1, 20)i;
+INSERT 20
+
+1: begin;
+BEGIN
+2: begin;
+BEGIN
+
+1: insert into t_concurrent_dmls select * from generate_series(1, 5);
+INSERT 5
+2: insert into t_concurrent_dmls select * from generate_series(1, 5);
+INSERT 5
+
+select * from (select gp_segment_id, locktype, relation::regclass::text, mode, granted from pg_locks where locktype = 'relation-dml')x where relation like 't_concurrent_dmls%';
+ gp_segment_id | locktype | relation | mode | granted 
+---------------+----------+----------+------+---------
+(0 rows)
+
+1: end;
+END
+2: end;
+END
+
+1q: ... <quitting>
+2q: ... <quitting>
+
+select * from t_concurrent_dmls;
+ c1 | c2 | c3 
+----+----+----
+ 4  | 4  | 4  
+ 7  | 7  | 7  
+ 8  | 8  | 8  
+ 11 | 11 | 11 
+ 17 | 17 | 17 
+ 18 | 18 | 18 
+ 4  |    |    
+ 4  |    |    
+ 2  | 2  | 2  
+ 5  | 5  | 5  
+ 6  | 6  | 6  
+ 9  | 9  | 9  
+ 10 | 10 | 10 
+ 12 | 12 | 12 
+ 16 | 16 | 16 
+ 20 | 20 | 20 
+ 2  |    |    
+ 5  |    |    
+ 2  |    |    
+ 5  |    |    
+ 1  | 1  | 1  
+ 3  | 3  | 3  
+ 13 | 13 | 13 
+ 14 | 14 | 14 
+ 15 | 15 | 15 
+ 19 | 19 | 19 
+ 1  |    |    
+ 3  |    |    
+ 1  |    |    
+ 3  |    |    
+(30 rows)
+
+drop table t_concurrent_dmls;
+DROP
+

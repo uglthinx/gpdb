@@ -29,17 +29,26 @@
 #include "utils/snapmgr.h"
 
 #include "cdb/ml_ipc.h"
+#include "cdb/cdbpartition.h"
 #include "commands/createas.h"
 #include "commands/queue.h"
 #include "commands/createas.h"
 #include "executor/spi.h"
+#include "parser/parsetree.h"
 #include "postmaster/autostats.h"
 #include "postmaster/backoff.h"
+#include "storage/lmgr.h"
 #include "utils/resource_manager.h"
 #include "utils/resscheduler.h"
 #include "utils/metrics_utils.h"
 #include "utils/tqual.h"
 
+
+typedef struct SplitUpdateFinderContext
+{
+	plan_tree_base_prefix base; /* Required prefix for plan_tree_walker/mutator */
+	bool is_splitupdate;
+} SplitUpdateFinderContext;
 
 /*
  * ActivePortal is the currently executing Portal (the most closely nested,
@@ -70,6 +79,10 @@ static uint64 DoPortalRunFetch(Portal portal,
 				 DestReceiver *dest);
 static void DoPortalRewind(Portal portal);
 static void PortalSetBackoffWeight(Portal portal);
+static void dmlConcurrenceControl(PlannedStmt *pstmt, Oid relid);
+static LOCKMODE deduceLockMode(PlannedStmt *pstmt);
+static bool isSplitUpdate(PlannedStmt *pstmt);
+static bool splitUpdateFinderWalker(Plan *node, void *context);
 
 /*
  * CreateQueryDesc
@@ -1446,6 +1459,26 @@ PortalRunMulti(Portal portal, bool isTopLevel,
 			 */
 			PlannedStmt *pstmt = (PlannedStmt *) stmt;
 
+			/*
+			 * Not all DMLs can be executed concurrently in GreenplumDB,
+			 * It is important to invoke dmlConcurrenceControl
+			 * before GetSnapshot.
+			 */
+			if (IS_QUERY_DISPATCHER() && pstmt &&
+				(pstmt->commandType == CMD_UPDATE ||
+				 pstmt->commandType == CMD_DELETE) &&
+				pstmt->rtable && pstmt->resultRelations)
+			{
+				Oid relid = getrelid(linitial_int(pstmt->resultRelations),
+									 pstmt->rtable);
+				Oid root = rel_partition_get_root(relid);
+
+				relid = root == InvalidOid ? relid : root;
+
+				if (relid != InvalidOid)
+					dmlConcurrenceControl(pstmt, relid);
+			}
+
 			TRACE_POSTGRESQL_QUERY_EXECUTE_START();
 
 			if (log_executor_stats)
@@ -1954,4 +1987,154 @@ PortalSetBackoffWeight(Portal portal)
 		/* Initialize the SHM backend entry with the computed backoff weight */
 		BackoffBackendEntryInit(gp_session_id, gp_command_count, weight);
 	}
+}
+
+/*
+ * dmlConcurrenceControl
+ *
+ * This function can only be called on QD and before Getsnapshot.
+ * It is used for serializing DMLs on QD and it uses a new type of
+ * lock to achieve this goal.
+ *
+ * Before invoking this function, it has stripped off the top motion
+ * node, which is gather motion for DML or Modifytable plan (because
+ * of returning clause).
+ *
+ * More details please refer the gpdb-dev mailing list link:
+ * https://groups.google.com/a/greenplum.org/forum/#!topic/gpdb-dev/tvI-VQZbtjI
+ *
+ * Insert is OK and other DMLs can be grouped into five class (Note:
+ * when talking about motions, the top gather motion to QD is ignored)
+ * c1. normal update (update statement whose plan contains no motion)
+ * c2. normal delete (delete statement whose plan contains no motion)
+ * c3. split-update (update statement on dist cols of hash-distributed table)
+ * c4. update whose plan has motions (like update t1 set c = c + 1 from t2 where ...)
+ * c5. delete whose plan has motions (like delete from t1 using t2 where t1.c = t2.c)
+ *
+ * If these operations are on the same table, the conflict relation among them
+ * should be:
+ *   c1 conflict with [c3, c4, c5]
+ *   c2 conflict with [c3]
+ *   c3 conflict with [c1, c2, c3, c4, c5]
+ *   c4 conflict with [c1, c3, c4, c5]
+ *   c5 conflict with [c1, c3, c4]
+ *
+ * Explanation on the conflict relations:
+ * 1. Splitupdate has to be conflict with any other operations.
+ *    This is because splitupdate's ExecInsert cannot be blocked
+ * 2. For the remaining operations, for each pair that might lead
+ *    to EvalPlanQual a subplan with motions on QE, such pair has
+ *    to be conflict with each other. And to invoke EvalPlanQual
+ *    there is a prerequisite: the tuple is marked as HeapUpdated
+ *    by some other transactions using heap_update.
+ *
+ * So the lockmode for these five operations can be:
+ *   c1 ---- RowExclusiveLock
+ *   c2 ---- RowShareLock
+ *   c3 ---- ExclusiveLock
+ *   c4 ---- ShareRowExclusiveLock
+ *   c5 ---- ShareLock
+ */
+static void
+dmlConcurrenceControl(PlannedStmt *pstmt, Oid relid)
+{
+	LOCKMODE        lockmode    = NoLock;
+	Relation        rel         = NULL;
+	Plan           *plan        = pstmt->planTree;
+
+	Assert(IS_QUERY_DISPATCHER());
+
+	if (plan == NULL)
+		return;
+
+	/*
+	 * AO table is already opened using ExclusiveLock at
+	 * parser stage, so here we can just skip them.
+	 *
+	 * TODO: need more investigation to combine AO
+	 * table's DML concurrence control logic with
+	 * the logic here so that can remove CdbTryOpenRelation.
+	 */
+	rel = heap_open(relid, NoLock);
+	if (RelationIsAppendOptimized(rel))
+	{
+		heap_close(rel, NoLock);
+		return;
+	}
+	heap_close(rel, NoLock);
+
+	lockmode = deduceLockMode(pstmt);
+	AcquireRelationDMLLock(relid, lockmode);
+}
+
+static LOCKMODE
+deduceLockMode(PlannedStmt *pstmt)
+{
+	Plan           *plan        = pstmt->planTree;
+	CmdType         commandType = pstmt->commandType;
+
+	if (commandType == CMD_UPDATE &&
+		isSplitUpdate(pstmt))
+		return ExclusiveLock;
+
+	if (IsA(plan, Motion))
+	{
+		/*
+		 * If this function is invoked, the plan
+		 * must be a ModifyTable or DML, and
+		 * if the top node is a motion, it must be
+		 * a garther motion to QD, strip off the potential
+		 * top gather motion.
+		 */
+		plan = outerPlan(plan);
+	}
+
+	Assert(IsA(plan, ModifyTable) || IsA(plan, DML));
+
+	if (commandType == CMD_UPDATE)
+	{
+		if (plan->nMotionNodes > 0)
+			return ShareRowExclusiveLock;
+		else
+			return RowExclusiveLock;
+	}
+	else
+	{
+		Assert(commandType == CMD_DELETE);
+
+		if (plan->nMotionNodes > 0)
+			return ShareLock;
+		else
+			return RowShareLock;
+	}
+}
+
+static bool
+isSplitUpdate(PlannedStmt *pstmt)
+{
+	SplitUpdateFinderContext ctx;
+	ctx.base.node = (Node *) pstmt;
+	ctx.is_splitupdate = false;
+
+	splitUpdateFinderWalker(pstmt->planTree, &ctx);
+	return ctx.is_splitupdate;
+}
+
+static bool
+splitUpdateFinderWalker(Plan *node, void *context)
+{
+	Assert(context);
+	SplitUpdateFinderContext *ctx = (SplitUpdateFinderContext *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, SplitUpdate))
+	{
+		ctx->is_splitupdate = true;
+		return true;	/* found our node; no more visit */
+	}
+
+	/* Continue walking */
+	return plan_tree_walker((Node*)node, splitUpdateFinderWalker, ctx);
 }

@@ -108,5 +108,6 @@ extern void DescribeLockTag(StringInfo buf, const LOCKTAG *tag);
 extern bool LockTagIsTemp(const LOCKTAG *tag);
 
 extern bool CondUpgradeRelLock(Oid relid);
+extern void AcquireRelationDMLLock(Oid relid, LOCKMODE lockmode);
 
 #endif   /* LMGR_H */

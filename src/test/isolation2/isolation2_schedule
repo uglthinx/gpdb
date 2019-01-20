@@ -1,3 +1,6 @@
+# test concurrent DML on the same table
+test: concurrent_dml concurrent_dml_partition concurrent_dml_inherit
+
 test: select_dropped_table
 # test update hash col under utility mode
 test: update_hash_col_utilitymode

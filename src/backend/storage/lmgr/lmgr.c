@@ -1097,3 +1097,12 @@ CondUpgradeRelLock(Oid relid)
 
 	return upgrade;
 }
+
+void
+AcquireRelationDMLLock(Oid relid, LOCKMODE lockmode)
+{
+	LOCKTAG         tag;
+
+	SET_LOCKTAG_RELATION_DML(tag, MyDatabaseId, relid);
+	(void) LockAcquire(&tag, lockmode, false, false);
+}

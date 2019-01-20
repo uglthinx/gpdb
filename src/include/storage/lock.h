@@ -201,6 +201,7 @@ typedef enum LockTagType
 	 * pg_description, but notice that we are constraining SUBID to 16 bits.
 	 * Also, we use DB OID = 0 for shared objects such as tablespaces.
 	 */
+	LOCKTAG_RELATION_DML,       /* relation-dml lock to serialize dmls on QD */
 	LOCKTAG_RESOURCE_QUEUE,		/* ID info for resource queue is QUEUE ID */
 	LOCKTAG_USERLOCK,			/* reserved for old contrib/userlock code */
 	LOCKTAG_ADVISORY			/* advisory user locks */
@@ -308,8 +309,16 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field2 = 0, \
 	 (locktag).locktag_field3 = 0, \
 	 (locktag).locktag_field4 = 0, \
-	 (locktag).locktag_type = LOCKTAG_RESOURCE_QUEUE,		\
+	 (locktag).locktag_type = LOCKTAG_RESOURCE_QUEUE, \
 	 (locktag).locktag_lockmethodid = RESOURCE_LOCKMETHOD)
+
+#define SET_LOCKTAG_RELATION_DML(locktag, dboid, reloid) \
+	((locktag).locktag_field1 = (dboid), \
+	 (locktag).locktag_field2 = (reloid), \
+	 (locktag).locktag_field3 = 0, \
+	 (locktag).locktag_field4 = 0, \
+	 (locktag).locktag_type = LOCKTAG_RELATION_DML, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 /*
  * Per-locked-object lock information:

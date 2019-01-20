@@ -1,4 +1,8 @@
 -- Test concurrent update a table with a varying length type
+-- This test intends to test two transaction concurrently
+-- modify the same tuple.
+
+-- FIXME: before this PR merge, let's consider if the set command can be removed.
 CREATE TABLE t_concurrent_update(a int, b int, c char(84));
 CREATE
 INSERT INTO t_concurrent_update VALUES(1,1,'test');
