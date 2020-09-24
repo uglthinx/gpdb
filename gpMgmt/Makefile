@@ -9,7 +9,7 @@ $(recurse)
 generate_greenplum_path_file:
 	mkdir -p $(DESTDIR)$(prefix)
 	unset LIBPATH; \
-	bin/generate-greenplum-path.sh $(prefix) > $(DESTDIR)$(prefix)/greenplum_path.sh
+	bin/generate-greenplum-path.sh > $(DESTDIR)$(prefix)/greenplum_path.sh
 
 install: generate_greenplum_path_file
 	mkdir -p $(DESTDIR)$(prefix)/lib/python
@@ -17,9 +17,6 @@ install: generate_greenplum_path_file
 	# Setup /lib/python contents
 	if [ -e bin/ext/__init__.py ]; then \
 	    cp -rp bin/ext/__init__.py $(DESTDIR)$(prefix)/lib/python ; \
-	fi
-	if [ -e bin/ext/lockfile ]; then \
-	    cp -rp bin/ext/lockfile $(DESTDIR)$(prefix)/lib/python ; \
 	fi
 	if [ -e bin/ext/psutil ]; then \
 	    cp -rp bin/ext/psutil $(DESTDIR)$(prefix)/lib/python ; \

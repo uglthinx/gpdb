@@ -1270,7 +1270,7 @@ class gpload:
         try:
             # do an initial parse, validating the config file
             doc = f.read()
-            self.config = yaml.load(doc)
+            self.config = yaml.safe_load(doc)
 
             self.configOriginal = changeToUnicode(self.config)
             self.config = dictKeyToLower(self.config)
@@ -1888,7 +1888,7 @@ class gpload:
 
                 # Mark this column as having no mapping, which is important
                 # for do_insert()
-                self.from_columns.append([key.lower(),d[key].lower(),None, False])
+                self.from_columns.append([quote_ident(key),d[key].lower(),None, False])
         else:
             self.from_columns = self.into_columns
             self.from_cols_from_user = False
@@ -2039,7 +2039,7 @@ class gpload:
                             on (pg_class.oid = attrelid)
                             %s
                         where
-                            relstorage in ('x', 'f') and
+                            relkind = 'f' and
                             relname like 'ext_gpload_reusable_%%' and
                             attnum > 0 and
                             not attisdropped and %s
@@ -2126,7 +2126,7 @@ class gpload:
                     on(pg_class.oid = pgext.reloid)
                     %s
                     where
-                    relstorage in ('x', 'f') and
+                    relkind = 'f' and
                     relname like 'ext_gpload_reusable_%%' and
 		    %s
                     """
@@ -2512,9 +2512,9 @@ class gpload:
         # MPP-14667 - self.reuse_tables should change one, and only one, aspect of how we build the following table,
         # and that is, whether it's a temp table or not. In other words, is_temp_table = '' iff self.reuse_tables == True.
         sql = 'CREATE %sTABLE %s ' % (is_temp_table, self.staging_table_name)
-        cols = map(lambda a:'%s %s' % (a[0], a[1]), target_columns)
+        cols = map(lambda a:'"%s" %s' % (a[0], a[1]), target_columns)
         sql += "(%s)" % ','.join(cols)
-        sql += " DISTRIBUTED BY (%s)" % ', '.join(distcols)
+        #sql += " DISTRIBUTED BY (%s)" % ', '.join(distcols)
         self.log(self.LOG, sql)
 
         if not self.options.D:
@@ -2758,7 +2758,7 @@ class gpload:
         sql += 'FROM %s) AS from_table ' % self.staging_table_name
         sql += 'LEFT OUTER JOIN %s into_table ' % self.get_qualified_tablename()
         sql += 'ON %s '%' AND '.join(match)
-        where = self.map_stuff('gpload:output:match_columns',lambda x,y:'into_table.%s IS NULL'%x,0)
+        where = self.map_stuff('gpload:output:match_columns',lambda x,y:'(into_table.%s IS NULL OR CAST(into_table.%s AS varchar) = \'\')'%(x,x),0)
         sql += 'WHERE %s ' % ' AND '.join(where)
         sql += 'AND gpload_row_number=1)'
 

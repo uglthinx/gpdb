@@ -1,32 +1,27 @@
 import codecs
 import math
 import fnmatch
-import getpass
 import glob
 import json
-import yaml
 import os
 import re
 import pipes
 import platform
 import shutil
 import socket
-import tarfile
 import tempfile
 import thread
-import json
+import time
 try:
     from subprocess32 import check_output, Popen, PIPE
 except:
     from subprocess import check_output, Popen, PIPE
 import commands
-import signal
 from collections import defaultdict
 
 import psutil
 from behave import given, when, then
 from datetime import datetime, timedelta
-from time import sleep
 from os import path
 
 from gppylib.gparray import GpArray, ROLE_PRIMARY, ROLE_MIRROR
@@ -184,6 +179,19 @@ def impl(conetxt, tabname):
                "('gpfdist://host.invalid:8000/file') format 'text'").format(tabname=tabname)
         dbconn.execSQL(conn, sql)
     conn.close()
+
+@given('the user create an external table with name "{tabname}" in partition table t')
+def impl(conetxt, tabname):
+    dbname = 'gptest'
+    with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
+        sql = ("create external table {tabname}(i int, j int) location "
+               "('gpfdist://host.invalid:8000/file') format 'text'").format(tabname=tabname)
+        dbconn.execSQL(conn, sql)
+        sql = "create table t(i int, j int) partition by list(i) (values(2018), values(1218))"
+        dbconn.execSQL(conn, sql)
+        sql = ("alter table t exchange partition for (2018) with table {tabname} without validation").format(tabname=tabname)
+        dbconn.execSQL(conn, sql)
+        conn.commit()
 
 @given('the user executes "{sql}" with named connection "{cname}"')
 def impl(context, cname, sql):
@@ -536,18 +544,18 @@ def impl(context, table_type, tablename, dbname):
 def impl(context, table_type, tablename, dbname, numrows):
     if not check_table_exists(context, dbname=dbname, table_name=tablename, table_type=table_type):
         raise Exception("Table '%s' of type '%s' does not exist when expected" % (tablename, table_type))
-        conn = dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False)
-        try:
-            rowcount = dbconn.querySingleton(conn, "SELECT count(*) FROM %s" % tablename)
-            if rowcount != numrows:
-                raise Exception("Expected to find %d rows in table %s, found %d" % (numrows, tablename, rowcount))
-        finally:
-            conn.close()
+    conn = dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False)
+    try:
+        rowcount = dbconn.querySingleton(conn, "SELECT count(*) FROM %s" % tablename)
+        if rowcount != int(numrows):
+            raise Exception("Expected to find %d rows in table %s, found %d" % (int(numrows), tablename, rowcount))
+    finally:
+        conn.close()
 
 @then(
-    'data for partition table "{table_name}" with partition level "{part_level}" is distributed across all segments on "{dbname}"')
-def impl(context, table_name, part_level, dbname):
-    validate_part_table_data_on_segments(context, table_name, part_level, dbname)
+    'data for partition table "{table_name}" with leaf partition distributed across all segments on "{dbname}"')
+def impl(context, table_name, dbname):
+    validate_part_table_data_on_segments(context, table_name, dbname)
 
 @then('verify that table "{tname}" in "{dbname}" has "{nrows}" rows')
 def impl(context, tname, dbname, nrows):
@@ -1234,6 +1242,7 @@ def impl(context):
         context.standby_host = standby
         run_gpcommand(context, 'gpinitstandby -ra')
 
+@given('the catalog has a standby master entry')
 @then('verify the standby master entries in catalog')
 def impl(context):
 	check_segment_config_query = "SELECT * FROM gp_segment_configuration WHERE content = -1 AND role = 'm'"
@@ -1610,6 +1619,7 @@ def impl(context, filename):
 
 
 @then('an attribute of table "{table}" in database "{dbname}" is deleted on segment with content id "{segid}"')
+@when('an attribute of table "{table}" in database "{dbname}" is deleted on segment with content id "{segid}"')
 def impl(context, table, dbname, segid):
     local_cmd = 'psql %s -t -c "SELECT port,hostname FROM gp_segment_configuration WHERE content=%s and role=\'p\';"' % (
     dbname, segid)
@@ -2008,7 +2018,7 @@ def step_impl(context, abbreviated_timezone):
 
 @then('the startup timezone is saved')
 def step_impl(context):
-    logfile = "%s/pg_log/startup.log" % os.getenv("MASTER_DATA_DIRECTORY")
+    logfile = "%s/log/startup.log" % os.getenv("MASTER_DATA_DIRECTORY")
     timezone = ""
     with open(logfile) as l:
         first_line = l.readline()
@@ -2637,18 +2647,6 @@ def _get_row_count_per_segment(table, dbname):
         rows = cursor.fetchall()
     conn.close()
     return [row[1] for row in rows] # indices are the gp segment id's, so no need to store them explicitly
-
-@given('set fault inject "{fault}"')
-@then('set fault inject "{fault}"')
-@when('set fault inject "{fault}"')
-def impl(context, fault):
-    os.environ['GPMGMT_FAULT_POINT'] = fault
-
-@given('unset fault inject')
-@then('unset fault inject')
-@when('unset fault inject')
-def impl(context):
-    os.environ['GPMGMT_FAULT_POINT'] = ""
 
 @given('run rollback')
 @then('run rollback')

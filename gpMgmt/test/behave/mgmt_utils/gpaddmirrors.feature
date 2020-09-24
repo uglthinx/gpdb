@@ -18,6 +18,19 @@ Feature: Tests for gpaddmirrors
 # The @concourse_cluster tag denotes the scenario that requires a remote cluster
 
     @concourse_cluster
+    Scenario: spread mirroring configuration
+        Given a working directory of the test as '/tmp/gpaddmirrors'
+        And the database is not running
+        And a cluster is created with "spread" segment mirroring on "mdw" and "sdw1, sdw2, sdw3"
+        Then verify that mirror segments are in "spread" configuration
+        Given a preferred primary has failed
+        When the user runs "gprecoverseg -a"
+        Then gprecoverseg should return a return code of 0
+        And all the segments are running
+        And the segments are synchronized
+        And the user runs "gpstop -aqM fast"
+
+    @concourse_cluster
     Scenario: gprecoverseg works correctly on a newly added mirror with HBA_HOSTNAMES=0
         Given a working directory of the test as '/tmp/gpaddmirrors'
         And the database is not running
@@ -146,9 +159,9 @@ Feature: Tests for gpaddmirrors
         And the segments are synchronized
         When user stops all primary processes
         And user can start transactions
-        Then verify that there is a "heap" table "public.heap_table" in "gptest" with "100" rows
-        Then verify that there is a "ao" table "public.ao_table" in "gptest" with "100" rows
-        Then verify that there is a "co" table "public.co_table" in "gptest" with "100" rows
+        Then verify that there is a "heap" table "public.heap_table" in "gptest" with "202" rows
+        Then verify that there is a "ao" table "public.ao_table" in "gptest" with "202" rows
+        Then verify that there is a "co" table "public.co_table" in "gptest" with "202" rows
         And the user runs "gpstop -aqM fast"
 
     @concourse_cluster

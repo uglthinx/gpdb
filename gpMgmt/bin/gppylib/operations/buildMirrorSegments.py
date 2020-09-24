@@ -26,9 +26,9 @@ logger = gplog.get_default_logger()
 gDatabaseDirectories = [
     # this list occur inside initdb.c
     "global",
-    "pg_log",
-    "pg_xlog",
-    "pg_clog",
+    "log",
+    "pg_wal",
+    "pg_xact",
     "pg_changetracking",
     "pg_subtrans",
     "pg_twophase",
@@ -294,8 +294,8 @@ class GpMirrorListToBuild:
 
             # Add to rewindInfo to execute pg_rewind later if we are not
             # using full recovery. We will run pg_rewind on incremental recovery
-            # if the target mirror does not have recovery.conf file because
-            # segment failover happened. The check for recovery.conf file will
+            # if the target mirror does not have standby.signal file because
+            # segment failover happened. The check for standby.signal file will
             # happen in the same remote SegmentRewind Command call.
             if not toRecover.isFullSynchronization() \
                and seg.getSegmentRole() == gparray.ROLE_MIRROR:
@@ -363,6 +363,7 @@ class GpMirrorListToBuild:
                                  dbname='template1')
             conn = dbconn.connect(dburl, utility=True)
             dbconn.execSQL(conn, "CHECKPOINT")
+            conn.close()
 
             # If the postmaster.pid still exists and another process
             # is actively using that pid, pg_rewind will fail when it

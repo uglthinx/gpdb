@@ -36,7 +36,6 @@ from gppylib.system import configurationInterface as configInterface
 from gppylib.system.environment import GpMasterEnvironment
 from gppylib.parseutils import line_reader, check_values, canonicalize_address
 from gppylib.utils import writeLinesToFile, normalizeAndValidateInputPath, TableLogger
-from gppylib.gphostcache import GpInterfaceToHostNameCache
 from gppylib.operations.utils import ParallelOperation
 from gppylib.operations.package import SyncPackages
 from gppylib.heapchecksum import HeapChecksum
@@ -216,7 +215,6 @@ class GpRecoverSegmentProgram:
                 rows.append(self._getParsedRow(filename, lineno, line))
 
         allAddresses = [row["newAddress"] for row in rows if "newAddress" in row]
-        interfaceLookup = GpInterfaceToHostNameCache(self.__pool, allAddresses, [None]*len(allAddresses))
 
         failedSegments = []
         failoverSegments = []
@@ -263,10 +261,9 @@ class GpRecoverSegmentProgram:
 
                 dataDirectory = normalizeAndValidateInputPath(row["newDataDirectory"], "config file",
                                                               row['lineno'])
-
-                hostName = interfaceLookup.getHostName(address)
-                if hostName is None:
-                    raise Exception('Unable to find host name for address %s from line:%s' % (address, row['lineno']))
+                # FIXME: hostname probably should not be address, but to do so, "hostname" should be added to gpaddmirrors config file
+                # FIXME: This appears identical to __getMirrorsToBuildFromConfigFilein clsAddMirrors
+                hostName = address
 
                 # now update values in failover segment
                 failoverSegment.setSegmentAddress(address)
@@ -789,8 +786,8 @@ class GpRecoverSegmentProgram:
     def mainOptions():
         """
         The dictionary this method returns instructs the simple_main framework
-        to check for a gprecoverseg.pid file under MASTER_DATA_DIRECTORY to
+        to check for a gprecoverseg.lock file under MASTER_DATA_DIRECTORY to
         prevent the customer from trying to run more than one instance of
         gprecoverseg at the same time.
         """
-        return {'pidfilename': 'gprecoverseg.pid', 'parentpidvar': 'GPRECOVERPID'}
+        return {'pidlockpath': 'gprecoverseg.lock', 'parentpidvar': 'GPRECOVERPID'}

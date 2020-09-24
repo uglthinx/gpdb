@@ -676,23 +676,39 @@ fill_buffer(URL_CURL_FILE *curl, int want)
 						e, curl_easy_strerror(e));
 		}
 
-		if (maxfd <= 0)
+		if (maxfd == 0)
 		{
 			elog(LOG, "curl_multi_fdset set maxfd = %d", maxfd);
 			curl->still_running = 0;
 			break;
 		}
-		nfds = select(maxfd+1, &fdread, &fdwrite, &fdexcep, &timeout);
-
+		/* When libcurl returns -1 in max_fd, it is because libcurl currently does something
+		 * that isn't possible for your application to monitor with a socket and unfortunately
+		 * you can then not know exactly when the current action is completed using select().
+		 * You then need to wait a while before you proceed and call curl_multi_perform anyway
+		 */
+		if (maxfd == -1)
+		{
+			elog(DEBUG2, "curl_multi_fdset set maxfd = %d", maxfd);
+			pg_usleep(100000);
+			// to call curl_multi_perform
+			nfds = 1;
+		}
+		else
+		{
+			nfds = select(maxfd+1, &fdread, &fdwrite, &fdexcep, &timeout);
+		}
 		if (nfds == -1)
 		{
+			int save_errno = errno;
 			if (errno == EINTR || errno == EAGAIN)
 			{
-				elog(DEBUG2, "select failed on curl_multi_fdset (maxfd %d) (%d - %s)", maxfd, errno, strerror(errno));
+				elog(DEBUG2, "select failed on curl_multi_fdset (maxfd %d) (%d - %s)", maxfd,
+					 save_errno, strerror(save_errno));
 				continue;
 			}
 			elog(ERROR, "internal error: select failed on curl_multi_fdset (maxfd %d) (%d - %s)",
-				 maxfd, errno, strerror(errno));
+				 maxfd, save_errno, strerror(save_errno));
 		}
 		else if (nfds == 0)
 		{
@@ -1007,12 +1023,13 @@ static int
 is_file_exists(const char* filename)
 {
 	FILE* file;
-    if ((file = fopen(filename, "r")) > 0)
-    {
-        fclose(file);
-        return 1;
-    }
-    return 0;
+	file = fopen(filename, "r");
+	if (file)
+	{
+		fclose(file);
+		return 1;
+	}
+	return 0;
 }
 
 URL_FILE *
@@ -1536,7 +1553,8 @@ gp_proto1_read(char *buf, int bufsz, URL_CURL_FILE *file, CopyState pstate, char
 
 				memcpy(fname, file->in.ptr + file->in.bot, len);
 				fname[len] = 0;
-				snprintf(pstate->cdbsreh->filename, sizeof pstate->cdbsreh->filename,"%s [%s]", pstate->filename, fname);
+				snprintf(pstate->cdbsreh->filename, sizeof pstate->cdbsreh->filename, "%s [%s]",
+						 file->common.url, fname);
 			}
 
 			file->in.bot += len;

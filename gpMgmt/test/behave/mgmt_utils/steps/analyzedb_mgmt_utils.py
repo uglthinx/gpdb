@@ -34,6 +34,7 @@ DEFAULT PARTITION default_dates);
 """
 
 
+
 @given('there is a regular "{storage_type}" table "{tablename}" with column name list "{col_name_list}" and column type list "{col_type_list}" in schema "{schemaname}"')
 def impl(context, storage_type, tablename, col_name_list, col_type_list, schemaname):
     schemaname_no_quote = schemaname
@@ -47,24 +48,24 @@ def impl(context, storage_type, tablename, col_name_list, col_type_list, scheman
     check_table_exists(context, context.dbname, '.'.join([schemaname, tablename]), table_type=storage_type)
 
 
-@given('there is a hard coded ao partition table "{tablename}" with 4 child partitions in schema "{schemaname}"')
+@given('there is a hard coded partition table "{tablename}" with 4 child partitions in schema "{schemaname}"')
 def impl(context, tablename, schemaname):
     if not check_schema_exists(context, schemaname, context.dbname):
         raise Exception("Schema %s does not exist in database %s" % (schemaname, context.dbname))
     drop_table_if_exists(context, '.'.join([schemaname, tablename]), context.dbname)
     with closing(dbconn.connect(dbconn.DbURL(dbname=context.dbname))) as conn:
         dbconn.execSQL(conn, CREATE_PARTITION_TABLE_SQL % (schemaname, tablename))
-    check_table_exists(context, context.dbname, '.'.join([schemaname, tablename]), table_type='ao')
+    check_table_exists(context, context.dbname, '.'.join([schemaname, tablename]), table_type=None)
 
 
-@given('there is a hard coded multi-level ao partition table "{tablename}" with 4 mid-level and 16 leaf-level partitions in schema "{schemaname}"')
+@given('there is a hard coded multi-level partition table "{tablename}" with 4 mid-level and 16 leaf-level partitions in schema "{schemaname}"')
 def impl(context, tablename, schemaname):
     if not check_schema_exists(context, schemaname, context.dbname):
         raise Exception("Schema %s does not exist in database %s" % (schemaname, context.dbname))
     drop_table_if_exists(context, '.'.join([schemaname, tablename]), context.dbname)
     with closing(dbconn.connect(dbconn.DbURL(dbname=context.dbname))) as conn:
         dbconn.execSQL(conn, CREATE_MULTI_PARTITION_TABLE_SQL % (schemaname, tablename))
-    check_table_exists(context, context.dbname, '.'.join([schemaname, tablename]), table_type='ao')
+    check_table_exists(context, context.dbname, '.'.join([schemaname, tablename]), table_type=None)
 
 
 @given('no state files exist for database "{dbname}"')
@@ -85,7 +86,13 @@ def impl(context, number, dbname):
 @given('a view "{view_name}" exists on table "{table_name}" in schema "{schema_name}"')
 def impl(context, view_name, table_name, schema_name):
     with closing(dbconn.connect(dbconn.DbURL(dbname=context.dbname))) as conn:
-        create_view_on_table(conn, schema_name, table_name, view_name)
+        create_view_on_table_in_schema(conn, schema_name, table_name, view_name)
+
+
+@given('a view "{view_name}" exists on table "{table_name}"')
+def impl(context, view_name, table_name):
+    with closing(dbconn.connect(dbconn.DbURL(dbname=context.dbname))) as conn:
+        create_view_on_table(context.conn, view_name, table_name)
 
 
 @given('"{qualified_table}" appears in the latest state files')
@@ -386,6 +393,7 @@ def create_table_with_column_list(conn, storage_type, schemaname, tablename, col
 
     query = 'CREATE TABLE %s.%s %s %s DISTRIBUTED RANDOMLY' % (schemaname, tablename, col_list, storage_str)
     dbconn.execSQL(conn, query)
+    conn.commit()
 
 
 def insert_data_into_table(conn, schemaname, tablename, col_type_list, num_rows="100"):
@@ -393,6 +401,7 @@ def insert_data_into_table(conn, schemaname, tablename, col_type_list, num_rows=
     col_str = ','.join(["(random()*i)::%s" % x for x in col_type_list])
     query = "INSERT INTO " + schemaname + '.' + tablename + " SELECT " + col_str + " FROM generate_series(1," + num_rows + ") i"
     dbconn.execSQL(conn, query)
+    conn.commit()
 
 
 def perform_ddl_on_table(conn, schemaname, tablename):
@@ -402,7 +411,15 @@ def perform_ddl_on_table(conn, schemaname, tablename):
     dbconn.execSQL(conn, query)
 
 
-def create_view_on_table(conn, schemaname, tablename, viewname):
+def create_view_on_table_in_schema(conn, schemaname, tablename, viewname):
     query = "CREATE OR REPLACE VIEW " + schemaname + "." + viewname + \
             " AS SELECT * FROM " + schemaname + "." + tablename
     dbconn.execSQL(conn, query)
+    conn.commit()
+
+
+def create_view_on_table(conn, viewname, tablename):
+    query = "CREATE OR REPLACE VIEW " + viewname + \
+            " AS SELECT * FROM " + tablename
+    dbconn.execSQL(conn, query)
+    conn.commit()

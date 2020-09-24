@@ -49,6 +49,8 @@
 #include "storage/buffile.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/faultinjector.h"
 #include "utils/workfile_mgr.h"
@@ -234,8 +236,9 @@ RegisterFileWithSet(File file, workfile_set *work_set)
 
 	LWLockAcquire(WorkFileManagerLock, LW_EXCLUSIVE);
 
-	Assert(work_set->active);
-	Assert(work_set->perquery->active);
+	if (!work_set->active || !work_set->perquery->active)
+		ereport(PANIC,
+				(errmsg("Register file to a non-active workfile_set/per-query summary is illegal")));
 
 	localEntry->work_set = work_set;
 	work_set->num_files++;
@@ -386,8 +389,9 @@ WorkFileDeleted(File file)
 	perquery = work_set->perquery;
 	oldsize = localEntry->size;
 
-	Assert(work_set->active);
-	Assert(perquery->active);
+	if (!work_set->active || !work_set->perquery->active)
+		ereport(PANIC,
+				(errmsg("workfile_set/per-query summarry is not active")));
 
 	/*
 	 * Update the summaries in shared memory
@@ -683,7 +687,7 @@ gp_workfile_mgr_cache_entries_internal(PG_FUNCTION_ARGS)
 		 * view gp_workfile_mgr_cache_entries
 		 */
 #define NUM_CACHE_ENTRIES_ELEM 8
-		TupleDesc tupdesc = CreateTemplateTupleDesc(NUM_CACHE_ENTRIES_ELEM, false);
+		TupleDesc tupdesc = CreateTemplateTupleDesc(NUM_CACHE_ENTRIES_ELEM);
 
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "segid", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "prefix", TEXTOID, -1, 0);
