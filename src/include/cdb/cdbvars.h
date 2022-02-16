@@ -724,6 +724,9 @@ extern bool gp_enable_sort_distinct;
 extern bool gp_enable_mk_sort;
 extern bool gp_enable_motion_mk_sort;
 
+/* Greenplum ordered set agg rerewrite */
+extern bool gp_enable_rewrite_ordered_set_agg;
+
 /* Alter table add column inherits storage setting from the table */
 extern bool gp_add_column_inherits_table_setting;
 

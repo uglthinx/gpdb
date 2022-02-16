@@ -50,6 +50,7 @@
 #include "utils/rel.h"
 
 #include "cdb/cdbhash.h"
+#include "cdb/cdborderedsetagg.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbutil.h"
 #include "catalog/gp_policy.h"
@@ -1608,6 +1609,10 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	Query	   *qry = makeNode(Query);
 	Node	   *qual;
 	ListCell   *l;
+
+	/* CDB: MPP ordered set agg rewrite */
+	if (gp_enable_rewrite_ordered_set_agg)
+		stmt = cdb_rewrite_ordered_set_agg(stmt);
 
 	qry->commandType = CMD_SELECT;
 

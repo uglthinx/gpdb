@@ -453,6 +453,9 @@ bool		gp_external_enable_filter_pushdown = true;
 bool		gp_enable_mk_sort = true;
 bool		gp_enable_motion_mk_sort = true;
 
+/* Greenplum ordered set agg rewrite */
+bool        gp_enable_rewrite_ordered_set_agg = true;
+
 /* Enable GDD */
 bool		gp_enable_global_deadlock_detector = false;
 
@@ -888,6 +891,18 @@ struct config_bool ConfigureNamesBool_gp[] =
 
 		},
 		&gp_enable_motion_mk_sort,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"gp_enable_rewrite_ordered_set_agg", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enable rewrite ordered set agg"),
+			NULL,
+			GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+
+		},
+		&gp_enable_rewrite_ordered_set_agg,
 		true,
 		NULL, NULL, NULL
 	},
