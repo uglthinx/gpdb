@@ -144,6 +144,9 @@ static ResTarget *create_restarget_with_val(Node *val);
 static ColumnRef *make_column_ref(Value *name);
 static CommonTableExpr *create_row_number_cte(SelectStmt *stmt, List *fc_infos,
 											  CommonTableExpr *base_cte);
+static CommonTableExpr *create_ordered_set_agg_cte(CommonTableExpr *base_cte,
+												   CommonTableExpr *row_number_cte,
+												   FuncCallInfo    *fc_info);
 
 
 /*
@@ -285,6 +288,7 @@ find_new_agg_name(List *agg_name)
 static SelectStmt *
 cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 {
+	List             *ordered_set_agg_ctes = NIL;
 	List             *fc_infos;
 	ListCell         *lc;
 	CommonTableExpr  *base_cte;
@@ -321,13 +325,41 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	/* Create row number CTE */
 	row_number_cte = create_row_number_cte(stmt, fc_infos, base_cte);
 
+	/* Create CTE for each ordered set agg */
+	foreach(lc, fc_infos)
+	{
+		FuncCallInfo    *fc_info;
+
+		fc_info = (FuncCallInfo *) lfirst(lc);
+		if (!fc_info->is_ordered_set_agg)
+			continue;
+		ordered_set_agg_ctes = lappend(ordered_set_agg_ctes,
+									   create_ordered_set_agg_cte(base_cte,
+																  row_number_cte,
+																  fc_info));
+	}
+
 	/* demo toy */
 	SelectStmt *new_stmt;
-	char *sql = "select * from base_cte, row_number_cte";
-	new_stmt = (SelectStmt *) linitial(raw_parser(sql));
+	StringInfoData sql;
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "select * from ");
+	int            ii=0;
+	foreach(lc, ordered_set_agg_ctes)
+	{
+		CommonTableExpr * cte = (CommonTableExpr *) lfirst(lc);
+		if (ii > 0)
+			appendStringInfo(&sql, ",");
+		appendStringInfo(&sql, "%s", cte->ctename);
+		ii++;
+	}
+	appendStringInfo(&sql, ";");
+
+	new_stmt = (SelectStmt *) linitial(raw_parser(sql.data));
 	WithClause *with = makeNode(WithClause);
 	with->location = -1;
 	with->ctes = list_make2(base_cte, row_number_cte);
+	with->ctes = list_concat(with->ctes, ordered_set_agg_ctes);
 	new_stmt->withClause = with;
 	return new_stmt;
 }
@@ -546,6 +578,10 @@ make_column_ref(Value *name)
 	return c;
 }
 
+/*
+ * create_row_number_cte
+ *   Refer to top comments Step 2 for details.
+ */
 static CommonTableExpr *
 create_row_number_cte(SelectStmt *stmt, List *fc_infos, CommonTableExpr *base_cte)
 {
@@ -587,6 +623,72 @@ create_row_number_cte(SelectStmt *stmt, List *fc_infos, CommonTableExpr *base_ct
 	cte->location = -1;
 	cte->aliascolnames = alias;
 	cte->ctequery = (Node *) row_number_stmt;
+
+	return cte;
+}
+
+/*
+ * create_ordered_set_agg_cte
+ *   Refer to the top comment's Step 3 for details.
+ */
+static CommonTableExpr *
+create_ordered_set_agg_cte(CommonTableExpr *base_cte,
+						   CommonTableExpr *row_number_cte,
+						   FuncCallInfo    *fc_info)
+{
+	CommonTableExpr      *cte        = makeNode(CommonTableExpr);
+	FuncCall             *func_call  = fc_info->func_call;
+	List                 *subq_tlist = NIL;
+	List                 *cte_tlist  = NIL;
+	List                 *cte_alias  = NIL;
+	SelectStmt           *subq_stmt  = makeNode(SelectStmt);
+	SelectStmt           *stmt       = makeNode(SelectStmt);
+	RangeSubselect       *rs         = makeNode(RangeSubselect);
+	Alias                *alias      = makeNode(Alias);
+	ColumnRef            *order;
+	ColumnRef            *row_number;
+	SortBy               *sortby;
+
+	/* set inner subquery's fromClause */
+	subq_stmt->fromClause = list_make2(makeRangeVar(NULL, base_cte->ctename, -1),
+									   makeRangeVar(NULL, row_number_cte->ctename, -1));
+	/* set filter of count agg if any */
+	if (fc_info->filter_name)
+		subq_stmt->whereClause = (Node *) make_column_ref(fc_info->filter_name);
+	/* set inner subquery's tlist */
+	order = make_column_ref(fc_info->order_name);
+	row_number = make_column_ref(fc_info->row_number_name);
+	subq_tlist = list_make2(create_restarget_with_val((Node *) order),
+							create_restarget_with_val((Node *) row_number));
+	subq_stmt->targetList = subq_tlist;
+	/* set SortBy clause */
+	sortby = (SortBy *) copyObject(linitial(func_call->agg_order));
+	sortby->location = -1;
+	sortby->node = (Node *) make_column_ref(fc_info->order_name);
+	subq_stmt->sortClause = list_make1(sortby);
+
+	rs->subquery = (Node *) subq_stmt;
+	/* FIXME: should be OK for any val */
+	alias->aliasname = "x";
+	rs->alias = alias;
+	stmt->fromClause = list_make1(rs);
+
+	/* create CTE's tlist and alias */
+	List     *special_agg_name = NIL;
+	List     *special_agg_args = NIL;
+	FuncCall *special_agg;
+
+	special_agg_name = find_new_agg_name(func_call->funcname);
+	special_agg_args = list_make3(order, linitial(func_call->args), row_number);
+	special_agg = makeFuncCall(special_agg_name, special_agg_args, -1);
+
+	cte_tlist = list_make1(create_restarget_with_val((Node *) special_agg));
+	stmt->targetList = cte_tlist;
+	cte_alias = list_make1(fc_info->whole_result_name);
+	cte->ctename = strVal(fc_info->whole_result_name);
+	cte->ctequery = (Node *) stmt;
+	cte->aliascolnames = cte_alias;
+	cte->location = -1;
 
 	return cte;
 }

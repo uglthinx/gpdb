@@ -1075,7 +1075,7 @@ convert_subquery_pathkeys(PlannerInfo *root, RelOptInfo *rel,
 														sub_expr_coll,
 														0,
 														rel->relids,
-														false); /* create_it */
+														true); /* create_it */
 
 					/*
 					 * If we don't find a matching EC, this sub-pathkey isn't
