@@ -291,7 +291,7 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 		return stmt;
 
 	/*
-	 * Set names.
+	 * Set names for raw expressions in fields in FuncCall.
 	 */
 	NameContext         context;
 	init_name_context(&context);
@@ -351,6 +351,17 @@ build_fc_infos_walk(Node *node, List **fc_infos)
 			/*
 			 * The case for user defined ordered-set-agg
 			 * we cannot handle this, quit at once.
+			 */
+			*fc_infos = NIL;
+			return true;
+		}
+
+		if (func_call->agg_order != NIL && new_agg_name == NIL)
+		{
+			/*
+			 * The case that has order-by clause but are not ordered
+			 * set agg. It might not be a problem, but to keep it
+			 * simple just ignore it.
 			 */
 			*fc_infos = NIL;
 			return true;
