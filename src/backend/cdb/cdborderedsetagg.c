@@ -4,6 +4,86 @@
  * Implement the algorithm that rewriting the Syntax Tree of  Ordered-Set-Agg
  * to achieve better performance in Greenplum.
  *
+ * The Problem:
+ *   select percentile_cont(0.5) within group (order by a) from t
+ *
+ *   If Greenplum uses the same plan and executor for the above SQL,
+ *   it will first gather all the raw data in to a single QE worker,
+ *   and then execute just like a single instance Postgres. This
+ *   method leads to poor performance in Greenplum.
+ *
+ * Idea:
+ *   We want to an algorithm to efficiently execute the SQL that
+ *   take the advantage of distributed computing: having many
+ *   sorted streams of data, anther single worker consumes the
+ *   sorted steams. This can make sort distributed. The final
+ *   single worker needs to know how many rows globally and we
+ *   need to "patch" this information before gathering sorted
+ *   streams. The consumer of the sorted streams is just a special
+ *   kind of aggregates. In summary, the idea is to rewrite the
+ *   query to something like this:
+ *     with base_cte(new_col) as (select a from t),
+ *          total_row_number(tot_row) as (select count(new_col) from base_cte)
+ *       select special_agg(0.5, new_col, tot_row) from
+ *         (select new_col, tot_row from base_cte, total_row_number order by new_col);
+ *
+ * Algorithm:
+ *   We only rewrite for very simple cases: without order-by, group-by ...
+ *   Such simple cases' queries (if we check and decide to rewrite) targetLists are
+ *   also simple: must be expressions involving FuncCall or Consts.
+ *
+ *   Let's use the following SQL as a practical example to show the algorithm.
+ *
+ *   select
+ *     count(*),
+ *     percentile_cont(0.2) within group (order by a+b) filter (where b > 3),
+ *     (percentile_cont(array[0.2, 0.5]) within group (order by c*a+1))[1],
+ *     sum(a*3) filter(where c>3 and 5>2) + percentile_cont(1) within group (order by a+b*5),
+ *     percentile_cont(0.7) within group (order by a+b using > )
+ *     1
+ *   from (select * from t1, t2 where t1.a = t2.b order by 1) x(a,b,c,d,e,f,g);
+ *
+ *  Step 1: find all FuncCall structs and build help data structures for each.
+ *    We want create a base CTE to compute all the non-const expressions.
+ *      - count(*): * means no input arguments, this do not ask anything from base result
+ *      - percentile_cont(0.2) within group (order by a+b) filter (where b > 3)
+ *        + order-by clause's expression a+b is needed, name it n1
+ *        + fitler clause's expression b>3)is needed, name it n2
+ *      - other FuncCalls are similar to handle, and the names mapping is:
+ *        a+b: n1, b>3: n2, c*a+1: n3, a*3: n4, c>3 and 5>2: n5, a+b*5: n6, a+b: n7
+ *    Create the base cte as:
+ *      with base_cte(n1,n2,n3,n4,n5,n6,n7) as
+ *        select a+b, b>3, c*a+1, a*3, c>3 and 5>2, a+b*5, a+b from
+ *        (select * from t1, t2 where t1.a = t2.b order by 1) x(a,b,c,d,e,f,g)
+ *
+ *  Step 2: for each ordered set agg, create the cte count the total numbers
+ *    We want to know each order by expression's total number (note this filter out NULL
+ *    automatically) that is why we need to create for each. In the above case, we need
+ *    to count for: n1, n3, n6, n7. Also note, we need to handle filter-clause here.
+ *
+ *    Create the row number cte as:
+ *      with row_number_cte(r1, r3, r6, r7) as
+ *        select count(n1) filter (n2), count(n3), count(n6), count(n7)
+ *        from base_cte
+ *
+ *  Step 3: for each ordered set agg, create a cte to compute its value.
+ *    We only show percentile_cont(0.2) within group (order by a+b) filter (where b > 3)
+ *    here.
+ *    3.1 patch the row number in the base cte for later use and sort them:
+ *        (select n1, r1 from base_cte, row_number_cte where n2 order by n1)
+ *    3.2 use special agg do the computation:
+ *        select special_agg(0.2, n1, r1) from
+ *          (select n1, r1 from base_cte, row_number_cte where n2 order by n1) tmp;
+ *
+ *    FIXME: the above rewrite needs to keep order of subquery, this needs extra code change.
+ *           Maybe reconsider this later.
+ *
+ *   Step 4: for all non-ordered-set-agg, create a CTE to computes them.
+ *     with normal_agg_cte (nagg1, nagg2) as
+ *       select count(*), sum(n4) filter(where n5) from base_cte
+ *
+ *   Step 5: put everything together and mutate the targetList based on the names.
+ *
  * Copyright (c) 2020-Present VMware, Inc. or its affiliates
  *
  * IDENTIFICATION
@@ -153,6 +233,14 @@ find_new_agg_name(List *agg_name)
 	return NIL;
 }
 
+/*
+ * cdb_rewrite_ordered_set_agg_internal
+ *   The core logic to implement the rewrite algorithm. When reaching
+ *   here, we have finished some simple check and first walk, found
+ *   at least one ordered-set-agg in the targetList. See the comments
+ *   at the top of this file to know the problem, solution idea and the
+ *   detailed algorithm.
+ */
 static SelectStmt *
 cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 {
