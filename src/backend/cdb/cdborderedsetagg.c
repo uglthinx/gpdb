@@ -100,9 +100,18 @@
 #include "cdb/cdborderedsetagg.h"
 
 
+typedef struct FuncCallInfo
+{
+	bool            is_ordered_set_agg;
+	FuncCall       *func_call; /* pointer to the original raw expr */
+} FuncCallInfo;
+
+
 static bool quick_search_ordered_set_agg_walk(Node *node, bool *found);
 static List *find_new_agg_name(List *agg_name);
 static SelectStmt *cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt);
+static List *build_func_call_infos(List *tlist);
+static bool build_fc_infos_walk(Node *node, List **fc_infos);
 
 
 /*
@@ -244,6 +253,78 @@ find_new_agg_name(List *agg_name)
 static SelectStmt *
 cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 {
-	elog(NOTICE, "will rewrite");
+	List     *fc_infos;
+
+	/*
+	 * In the algorithm mentioned in the comments at the top of
+	 * the file, we know FuncCall structs are key to the rewrite
+	 * procedure and we have to create several names for some
+	 * fields. The information is built below.
+	 */
+	fc_infos = build_func_call_infos(stmt->targetList);
+
 	return stmt;
+}
+
+/*
+ * build_func_call_infos
+ *   This function creates FuncCallInfo for each FuncCall
+ *   raw expression. NOTE it might return NIL since the
+ *   first walk through is quit-soon-walk it does not check
+ *   every ordered-set-agg. When it returns NIL, we still
+ *   do not rewrite the SQL.
+ */
+static List *
+build_func_call_infos(List *tlist)
+{
+	List    *fc_infos = NIL;
+
+	(void) raw_expression_tree_walker((Node *) tlist,
+									  build_fc_infos_walk,
+									  (void *) &fc_infos);
+
+	return fc_infos;
+}
+
+static bool
+build_fc_infos_walk(Node *node, List **fc_infos)
+{
+	if (node == NULL)
+		return false;
+
+	/* Must keep the same as quick_search_ordered_set_agg_walk */
+	if (IsA(node, SubLink))
+		return false;
+
+	if (IsA(node, FuncCall))
+	{
+		FuncCall     *func_call;
+		FuncCallInfo *fc_info;
+		List         *new_agg_name = NIL;
+
+		func_call = (FuncCall *) node;
+
+		if (func_call->agg_within_group &&
+			(new_agg_name=find_new_agg_name(func_call->funcname)) == NIL)
+		{
+			/*
+			 * The case for user defined ordered-set-agg
+			 * we cannot handle this, quit at once.
+			 */
+			*fc_infos = NIL;
+			return true;
+		}
+
+		fc_info = (FuncCallInfo *) palloc0(sizeof(FuncCallInfo));
+		fc_info->func_call = func_call;
+		fc_info->is_ordered_set_agg = (new_agg_name != NIL);
+
+		*fc_infos = lappend(*fc_infos, fc_info);
+
+		return false;
+	}
+
+	return raw_expression_tree_walker(node,
+									  build_fc_infos_walk,
+									  (void *) fc_infos);
 }
