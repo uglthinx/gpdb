@@ -100,11 +100,31 @@
 #include "cdb/cdborderedsetagg.h"
 
 
+#define MAX_NAME_SIZE 32
+
+
 typedef struct FuncCallInfo
 {
 	bool            is_ordered_set_agg;
-	FuncCall       *func_call; /* pointer to the original raw expr */
+	FuncCall       *func_call;           /* pointer to the original raw expr */
+	List           *arg_names;           /* new name for func call args */
+	Value          *order_name;          /* new name for order by expr */
+	Value          *filter_name;         /* new name for filter expr */
+	Value          *whole_result_name;   /* new name for whole result */
 } FuncCallInfo;
+
+typedef struct NameContext
+{
+	int      cnt;
+} NameContext;
+
+typedef enum NameType
+{
+	NEW_NAME_ARG,
+	NEW_NAME_ORDER,
+	NEW_NAME_FILTER,
+	NEW_NAME_WHOLE
+} NameType;
 
 
 static bool quick_search_ordered_set_agg_walk(Node *node, bool *found);
@@ -112,6 +132,9 @@ static List *find_new_agg_name(List *agg_name);
 static SelectStmt *cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt);
 static List *build_func_call_infos(List *tlist);
 static bool build_fc_infos_walk(Node *node, List **fc_infos);
+static void set_name_for_func_call_info(FuncCallInfo *fc_info, NameContext *context);
+static Value *create_name(FuncCall *func_call, NameContext *context, NameType type);
+static void init_name_context(NameContext *context);
 
 
 /*
@@ -253,7 +276,8 @@ find_new_agg_name(List *agg_name)
 static SelectStmt *
 cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 {
-	List     *fc_infos;
+	List        *fc_infos;
+	ListCell    *lc;
 
 	/*
 	 * In the algorithm mentioned in the comments at the top of
@@ -262,6 +286,23 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	 * fields. The information is built below.
 	 */
 	fc_infos = build_func_call_infos(stmt->targetList);
+
+	if (fc_infos == NIL)
+		return stmt;
+
+	/*
+	 * Set names.
+	 */
+	NameContext         context;
+	init_name_context(&context);
+
+	foreach(lc, fc_infos)
+	{
+		FuncCallInfo    *fc_info;
+
+		fc_info = (FuncCallInfo *) lfirst(lc);
+		set_name_for_func_call_info(fc_info, &context);
+	}
 
 	return stmt;
 }
@@ -327,4 +368,64 @@ build_fc_infos_walk(Node *node, List **fc_infos)
 	return raw_expression_tree_walker(node,
 									  build_fc_infos_walk,
 									  (void *) fc_infos);
+}
+
+static void
+set_name_for_func_call_info(FuncCallInfo *fc_info, NameContext *context)
+{
+	FuncCall       *func_call = fc_info->func_call;
+	int             i;
+
+	/*
+	 * Create names for func call's argments. we do not need
+	 * to do this for the ordered set agg we want to rewrite
+	 * and for those agg_star.
+	 *
+	 * FIXME: check for func_variadic and quit early???
+	 */
+	if (!func_call->agg_star && !fc_info->is_ordered_set_agg)
+	{
+		for (i = 0; i < list_length(func_call->args); i++)
+		{
+			Value *name = create_name(func_call, context, NEW_NAME_ARG);
+			fc_info->arg_names = lappend(fc_info->arg_names, name);
+		}
+	}
+
+	/* Create name for order by clause if needed */
+	if (fc_info->is_ordered_set_agg)
+	{
+		Assert(list_length(func_call->agg_order) == 1);
+		fc_info->order_name = create_name(func_call, context, NEW_NAME_ORDER);
+	}
+
+	/* Create name for filter clause if needed */
+	if (func_call->agg_filter)
+		fc_info->filter_name = create_name(func_call, context, NEW_NAME_FILTER);
+
+	/* Create name for whole result of the FuncCall */
+	fc_info->whole_result_name = create_name(func_call, context, NEW_NAME_WHOLE);
+}
+
+/*
+ * create_name
+ *   generate a new name for the raw expr, shared information is stored in
+ *   a context, and the generation-policy is determined by the arg type.
+ *   Has side-effect that will modify context.
+ *
+ *   FIXME: refine this later.
+ */
+static Value *
+create_name(FuncCall *func_call, NameContext *context, NameType type)
+{
+	char *name = (char *) palloc(MAX_NAME_SIZE);
+	snprintf(name, MAX_NAME_SIZE, "n%d", context->cnt);
+	context->cnt++;
+	return makeString(name);
+}
+
+static void
+init_name_context(NameContext *context)
+{
+	context->cnt = 0;
 }
