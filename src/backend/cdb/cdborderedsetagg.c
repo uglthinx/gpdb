@@ -96,6 +96,7 @@
 
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "parser/parser.h"
 
 #include "cdb/cdborderedsetagg.h"
 
@@ -135,6 +136,8 @@ static bool build_fc_infos_walk(Node *node, List **fc_infos);
 static void set_name_for_func_call_info(FuncCallInfo *fc_info, NameContext *context);
 static Value *create_name(FuncCall *func_call, NameContext *context, NameType type);
 static void init_name_context(NameContext *context);
+static CommonTableExpr *create_base_cte(SelectStmt *stmt, List *fc_infos);
+static ResTarget *create_restarget_with_val(Node *val);
 
 
 /*
@@ -276,8 +279,9 @@ find_new_agg_name(List *agg_name)
 static SelectStmt *
 cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 {
-	List        *fc_infos;
-	ListCell    *lc;
+	List             *fc_infos;
+	ListCell         *lc;
+	CommonTableExpr  *base_cte;
 
 	/*
 	 * In the algorithm mentioned in the comments at the top of
@@ -304,7 +308,18 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 		set_name_for_func_call_info(fc_info, &context);
 	}
 
-	return stmt;
+	/* Create Base CTE */
+	base_cte = create_base_cte(stmt, fc_infos);
+
+	/* demo toy */
+	SelectStmt *new_stmt;
+	char *sql = "select * from base_cte";
+	new_stmt = (SelectStmt *) linitial(raw_parser(sql));
+	WithClause *with = makeNode(WithClause);
+	with->location = -1;
+	with->ctes = list_make1(base_cte);
+	new_stmt->withClause = with;
+	return new_stmt;
 }
 
 /*
@@ -439,4 +454,74 @@ static void
 init_name_context(NameContext *context)
 {
 	context->cnt = 0;
+}
+
+static CommonTableExpr *
+create_base_cte(SelectStmt *stmt, List *fc_infos)
+{
+	CommonTableExpr  *cte      = makeNode(CommonTableExpr);
+	SelectStmt       *new_stmt = (SelectStmt* ) copyObject(stmt);
+	List             *tlist    = NIL;
+	List             *alias    = NIL;
+	ListCell         *lc;
+
+	foreach(lc, fc_infos)
+	{
+		FuncCallInfo    *fc_info;
+		FuncCall        *func_call;
+		ListCell        *lc1;
+		ListCell        *lc2;
+
+		fc_info = (FuncCallInfo *) lfirst(lc);
+		func_call = fc_info->func_call;
+
+		/* args */
+		if (fc_info->arg_names)
+		{
+			forboth(lc1, func_call->args, lc2, fc_info->arg_names)
+			{
+				Node      *arg      = (Node *) lfirst(lc1);
+				Value     *arg_name = (Value *) lfirst(lc2);
+				tlist = lappend(tlist, create_restarget_with_val(arg));
+				alias = lappend(alias, arg_name);
+			}
+		}
+
+		/* order */
+		if (fc_info->order_name)
+		{
+			SortBy *order = (SortBy *) linitial(func_call->agg_order);
+			Assert(list_length(func_call->agg_order) == 1);
+			tlist = lappend(tlist, create_restarget_with_val(order->node));
+			alias = lappend(alias, fc_info->order_name);
+		}
+
+		/* filter */
+		if (fc_info->filter_name)
+		{
+			Node *filter = func_call->agg_filter;
+			tlist = lappend(tlist, create_restarget_with_val(filter));
+			alias = lappend(alias, fc_info->filter_name);
+		}
+	}
+
+	new_stmt->targetList = tlist;
+	//FIXME: set cte name better
+	cte->ctename = "base_cte";
+	cte->ctequery = (Node *) new_stmt;
+	cte->aliascolnames = alias;
+	cte->location = -1;
+
+	return cte;
+}
+
+static ResTarget *
+create_restarget_with_val(Node *val)
+{
+	ResTarget *rt = makeNode(ResTarget);
+
+	rt->location = -1;
+	rt->val = val;
+
+	return rt;
 }
