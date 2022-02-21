@@ -142,8 +142,7 @@ static void init_name_context(NameContext *context);
 static CommonTableExpr *create_base_cte(SelectStmt *stmt, List *fc_infos);
 static ResTarget *create_restarget_with_val(Node *val);
 static ColumnRef *make_column_ref(Value *name);
-static CommonTableExpr *create_row_number_cte(SelectStmt *stmt, List *fc_infos,
-											  CommonTableExpr *base_cte);
+static CommonTableExpr *create_row_number_cte(List *fc_infos, CommonTableExpr *base_cte);
 static CommonTableExpr *create_ordered_set_agg_cte(CommonTableExpr *base_cte,
 												   CommonTableExpr *row_number_cte,
 												   FuncCallInfo    *fc_info);
@@ -323,7 +322,7 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	base_cte = create_base_cte(stmt, fc_infos);
 
 	/* Create row number CTE */
-	row_number_cte = create_row_number_cte(stmt, fc_infos, base_cte);
+	row_number_cte = create_row_number_cte(fc_infos, base_cte);
 
 	/* Create CTE for each ordered set agg */
 	foreach(lc, fc_infos)
@@ -583,7 +582,7 @@ make_column_ref(Value *name)
  *   Refer to top comments Step 2 for details.
  */
 static CommonTableExpr *
-create_row_number_cte(SelectStmt *stmt, List *fc_infos, CommonTableExpr *base_cte)
+create_row_number_cte(List *fc_infos, CommonTableExpr *base_cte)
 {
 	CommonTableExpr *cte             = makeNode(CommonTableExpr);
 	SelectStmt      *row_number_stmt = makeNode(SelectStmt);
