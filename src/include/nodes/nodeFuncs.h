@@ -63,5 +63,7 @@ extern Node *query_or_expression_tree_mutator(Node *node, Node *(*mutator) (),
 
 extern bool raw_expression_tree_walker(Node *node, bool (*walker) (),
 												   void *context);
+extern Node *raw_expression_tree_mutator(Node *node, Node *(*mutator)(),
+										 void *context);
 
 #endif   /* NODEFUNCS_H */
