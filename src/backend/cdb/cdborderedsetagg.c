@@ -146,6 +146,8 @@ static CommonTableExpr *create_row_number_cte(List *fc_infos, CommonTableExpr *b
 static CommonTableExpr *create_ordered_set_agg_cte(CommonTableExpr *base_cte,
 												   CommonTableExpr *row_number_cte,
 												   FuncCallInfo    *fc_info);
+static CommonTableExpr *create_normal_func_calls_cte(List *fc_infos,
+													 CommonTableExpr *base_cte);
 
 
 /*
@@ -292,6 +294,7 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	ListCell         *lc;
 	CommonTableExpr  *base_cte;
 	CommonTableExpr  *row_number_cte;
+	CommonTableExpr  *normal_func_calls_cte;
 
 	/*
 	 * In the algorithm mentioned in the comments at the top of
@@ -338,6 +341,9 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 																  fc_info));
 	}
 
+	/* Create CTE for normal func calls */
+	normal_func_calls_cte = create_normal_func_calls_cte(fc_infos, base_cte);
+
 	/* demo toy */
 	SelectStmt *new_stmt;
 	StringInfoData sql;
@@ -352,6 +358,8 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 		appendStringInfo(&sql, "%s", cte->ctename);
 		ii++;
 	}
+	if (normal_func_calls_cte)
+		appendStringInfo(&sql, ", %s", normal_func_calls_cte->ctename);
 	appendStringInfo(&sql, ";");
 
 	new_stmt = (SelectStmt *) linitial(raw_parser(sql.data));
@@ -359,6 +367,8 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	with->location = -1;
 	with->ctes = list_make2(base_cte, row_number_cte);
 	with->ctes = list_concat(with->ctes, ordered_set_agg_ctes);
+	if (normal_func_calls_cte)
+		with->ctes = lappend(with->ctes, normal_func_calls_cte);
 	new_stmt->withClause = with;
 	return new_stmt;
 }
@@ -688,6 +698,62 @@ create_ordered_set_agg_cte(CommonTableExpr *base_cte,
 	cte->ctequery = (Node *) stmt;
 	cte->aliascolnames = cte_alias;
 	cte->location = -1;
+
+	return cte;
+}
+
+static CommonTableExpr *
+create_normal_func_calls_cte(List *fc_infos, CommonTableExpr *base_cte)
+{
+	CommonTableExpr     *cte   = NULL;
+	SelectStmt          *stmt  = makeNode(SelectStmt);
+	List                *tlist = NIL;
+	List                *alias = NIL;
+	ListCell            *lc;
+
+	foreach(lc, fc_infos)
+	{
+		FuncCallInfo    *fc_info   = (FuncCallInfo *) lfirst(lc);
+		FuncCall        *func_call;
+
+		if (fc_info->is_ordered_set_agg)
+			continue;
+
+		func_call = (FuncCall *) copyObject(fc_info->func_call);
+		/* args */
+		if (!func_call->agg_star)
+		{
+			ListCell     *cell;
+
+			func_call->args = NIL;
+			foreach(cell, fc_info->arg_names)
+			{
+				Value  *arg_name = (Value *) lfirst(cell);
+				func_call->args = lappend(func_call->args,
+										  make_column_ref(arg_name));
+			}
+		}
+		/* filter */
+		if (fc_info->filter_name)
+			func_call->agg_filter = (Node *) make_column_ref(fc_info->filter_name);
+
+		tlist = lappend(tlist, create_restarget_with_val((Node *) func_call));
+		alias = lappend(alias, fc_info->whole_result_name);
+	}
+
+	if (tlist == NIL)
+		return NULL;
+
+	stmt->targetList = tlist;
+	stmt->fromClause = list_make1(makeRangeVar(NULL, base_cte->ctename, -1));
+
+	cte = makeNode(CommonTableExpr);
+
+	//FIXME: change a good name policy
+	cte->ctename = "normal_agg_cte";
+	cte->location = -1;
+	cte->aliascolnames = alias;
+	cte->ctequery = (Node *) stmt;
 
 	return cte;
 }
