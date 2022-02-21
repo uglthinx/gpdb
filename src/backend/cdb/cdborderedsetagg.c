@@ -130,6 +130,11 @@ typedef enum NameType
 	NEW_NAME_WHOLE
 } NameType;
 
+typedef struct ReplaceTlistContext
+{
+	ListCell    *fc_info;
+} ReplaceTlistContext;
+
 
 static bool quick_search_ordered_set_agg_walk(Node *node, bool *found);
 static List *find_new_agg_name(List *agg_name);
@@ -148,6 +153,7 @@ static CommonTableExpr *create_ordered_set_agg_cte(CommonTableExpr *base_cte,
 												   FuncCallInfo    *fc_info);
 static CommonTableExpr *create_normal_func_calls_cte(List *fc_infos,
 													 CommonTableExpr *base_cte);
+static Node *replace_tlist_mutator(Node *node, ReplaceTlistContext *context);
 
 
 /*
@@ -289,12 +295,16 @@ find_new_agg_name(List *agg_name)
 static SelectStmt *
 cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 {
-	List             *ordered_set_agg_ctes = NIL;
-	List             *fc_infos;
-	ListCell         *lc;
-	CommonTableExpr  *base_cte;
-	CommonTableExpr  *row_number_cte;
-	CommonTableExpr  *normal_func_calls_cte;
+	List               *ordered_set_agg_ctes = NIL;
+	List               *fc_infos;
+	ListCell           *lc;
+	CommonTableExpr    *base_cte;
+	CommonTableExpr    *row_number_cte;
+	CommonTableExpr    *normal_func_calls_cte;
+	SelectStmt         *final_stmt;
+	WithClause         *with;
+	List               *from;
+	ReplaceTlistContext replace_tlist_context;
 
 	/*
 	 * In the algorithm mentioned in the comments at the top of
@@ -310,15 +320,15 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	/*
 	 * Set names for raw expressions in fields in FuncCall.
 	 */
-	NameContext         context;
-	init_name_context(&context);
+	NameContext       name_context;
+	init_name_context(&name_context);
 
 	foreach(lc, fc_infos)
 	{
 		FuncCallInfo    *fc_info;
 
 		fc_info = (FuncCallInfo *) lfirst(lc);
-		set_name_for_func_call_info(fc_info, &context);
+		set_name_for_func_call_info(fc_info, &name_context);
 	}
 
 	/* Create Base CTE */
@@ -344,33 +354,36 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	/* Create CTE for normal func calls */
 	normal_func_calls_cte = create_normal_func_calls_cte(fc_infos, base_cte);
 
-	/* demo toy */
-	SelectStmt *new_stmt;
-	StringInfoData sql;
-	initStringInfo(&sql);
-	appendStringInfo(&sql, "select * from ");
-	int            ii=0;
+	/* Create the final SelectStmt */
+	final_stmt = makeNode(SelectStmt);
+	/* set fromClause */
+	from = NIL;
 	foreach(lc, ordered_set_agg_ctes)
 	{
-		CommonTableExpr * cte = (CommonTableExpr *) lfirst(lc);
-		if (ii > 0)
-			appendStringInfo(&sql, ",");
-		appendStringInfo(&sql, "%s", cte->ctename);
-		ii++;
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+		from = lappend(from, makeRangeVar(NULL, cte->ctename, -1));
 	}
 	if (normal_func_calls_cte)
-		appendStringInfo(&sql, ", %s", normal_func_calls_cte->ctename);
-	appendStringInfo(&sql, ";");
-
-	new_stmt = (SelectStmt *) linitial(raw_parser(sql.data));
-	WithClause *with = makeNode(WithClause);
+	{
+		from = lappend(from,
+					   makeRangeVar(NULL, normal_func_calls_cte->ctename, -1));
+	}
+	final_stmt->fromClause = from;
+	/* set CTEs */
+	with = makeNode(WithClause);
 	with->location = -1;
-	with->ctes = list_make2(base_cte, row_number_cte);
-	with->ctes = list_concat(with->ctes, ordered_set_agg_ctes);
+	with->ctes = list_concat(list_make2(base_cte, row_number_cte),
+							 ordered_set_agg_ctes);
 	if (normal_func_calls_cte)
 		with->ctes = lappend(with->ctes, normal_func_calls_cte);
-	new_stmt->withClause = with;
-	return new_stmt;
+	final_stmt->withClause = with;
+	/* set targetList */
+	replace_tlist_context.fc_info = fc_infos->head;
+	final_stmt->targetList = (List *) raw_expression_tree_mutator((Node *) stmt->targetList,
+																  replace_tlist_mutator,
+																  &replace_tlist_context);
+
+	return final_stmt;
 }
 
 /*
@@ -756,4 +769,27 @@ create_normal_func_calls_cte(List *fc_infos, CommonTableExpr *base_cte)
 	cte->ctequery = (Node *) stmt;
 
 	return cte;
+}
+
+static Node *
+replace_tlist_mutator(Node *node, ReplaceTlistContext *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, SubLink))
+		return node;
+
+	if (IsA(node, FuncCall))
+	{
+		FuncCallInfo    *fc_info;
+		ColumnRef       *col;
+
+		fc_info = (FuncCallInfo *) lfirst(context->fc_info);
+		col = make_column_ref(fc_info->whole_result_name);
+		context->fc_info = context->fc_info->next;
+		return (Node *) col;
+	}
+
+	return raw_expression_tree_mutator(node, replace_tlist_mutator, context);
 }

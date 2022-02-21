@@ -55,5 +55,6 @@ create AGGREGATE pg_catalog.special_agg_cont(float8, float8, bigint)
     initcond = '(-1, -1, 0, 0)'
 );
 
-create table t(a float8);
-insert into t select i from generate_series(1, 10)i;
+create table t(a float8, b float8, c float8,
+               d float8, e float8, f float8, g float8);
+insert into t select i,i,i,i,i,i,i from generate_series(1, 10)i;
