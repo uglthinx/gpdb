@@ -94,6 +94,7 @@
 
 #include "postgres.h"
 
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "parser/parser.h"
@@ -111,6 +112,7 @@ typedef struct FuncCallInfo
 	List           *arg_names;           /* new name for func call args */
 	Value          *order_name;          /* new name for order by expr */
 	Value          *filter_name;         /* new name for filter expr */
+	Value          *row_number_name;     /* new name for count() expr */
 	Value          *whole_result_name;   /* new name for whole result */
 } FuncCallInfo;
 
@@ -123,6 +125,7 @@ typedef enum NameType
 {
 	NEW_NAME_ARG,
 	NEW_NAME_ORDER,
+	NEW_NAME_COUNT,
 	NEW_NAME_FILTER,
 	NEW_NAME_WHOLE
 } NameType;
@@ -138,6 +141,9 @@ static Value *create_name(FuncCall *func_call, NameContext *context, NameType ty
 static void init_name_context(NameContext *context);
 static CommonTableExpr *create_base_cte(SelectStmt *stmt, List *fc_infos);
 static ResTarget *create_restarget_with_val(Node *val);
+static ColumnRef *make_column_ref(Value *name);
+static CommonTableExpr *create_row_number_cte(SelectStmt *stmt, List *fc_infos,
+											  CommonTableExpr *base_cte);
 
 
 /*
@@ -282,6 +288,7 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	List             *fc_infos;
 	ListCell         *lc;
 	CommonTableExpr  *base_cte;
+	CommonTableExpr  *row_number_cte;
 
 	/*
 	 * In the algorithm mentioned in the comments at the top of
@@ -311,13 +318,16 @@ cdb_rewrite_ordered_set_agg_internal(SelectStmt *stmt)
 	/* Create Base CTE */
 	base_cte = create_base_cte(stmt, fc_infos);
 
+	/* Create row number CTE */
+	row_number_cte = create_row_number_cte(stmt, fc_infos, base_cte);
+
 	/* demo toy */
 	SelectStmt *new_stmt;
-	char *sql = "select * from base_cte";
+	char *sql = "select * from base_cte, row_number_cte";
 	new_stmt = (SelectStmt *) linitial(raw_parser(sql));
 	WithClause *with = makeNode(WithClause);
 	with->location = -1;
-	with->ctes = list_make1(base_cte);
+	with->ctes = list_make2(base_cte, row_number_cte);
 	new_stmt->withClause = with;
 	return new_stmt;
 }
@@ -418,11 +428,12 @@ set_name_for_func_call_info(FuncCallInfo *fc_info, NameContext *context)
 		}
 	}
 
-	/* Create name for order by clause if needed */
+	/* Create name for order by clause and count expr if needed */
 	if (fc_info->is_ordered_set_agg)
 	{
 		Assert(list_length(func_call->agg_order) == 1);
 		fc_info->order_name = create_name(func_call, context, NEW_NAME_ORDER);
+		fc_info->row_number_name = create_name(func_call, context, NEW_NAME_COUNT);
 	}
 
 	/* Create name for filter clause if needed */
@@ -524,4 +535,58 @@ create_restarget_with_val(Node *val)
 	rt->val = val;
 
 	return rt;
+}
+
+static ColumnRef *
+make_column_ref(Value *name)
+{
+	ColumnRef    *c = makeNode(ColumnRef);
+	c->location = -1;
+	c->fields = list_make1(name);
+	return c;
+}
+
+static CommonTableExpr *
+create_row_number_cte(SelectStmt *stmt, List *fc_infos, CommonTableExpr *base_cte)
+{
+	CommonTableExpr *cte             = makeNode(CommonTableExpr);
+	SelectStmt      *row_number_stmt = makeNode(SelectStmt);
+	List            *tlist           = NIL;
+	List            *alias           = NIL;
+	List            *count_fc_name;
+	ListCell        *lc;
+
+	count_fc_name = list_make2(makeString("pg_catalog"),
+							   makeString("count"));
+
+	foreach(lc, fc_infos)
+	{
+		FuncCallInfo    *fc_info;
+		FuncCall        *fc_count;
+
+		fc_info = (FuncCallInfo *) lfirst(lc);
+		if (!fc_info->is_ordered_set_agg)
+			continue;
+
+		fc_count = makeFuncCall(count_fc_name,
+								list_make1(make_column_ref(fc_info->order_name)),
+								-1);
+		/* attach filter */
+		if (fc_info->filter_name)
+			fc_count->agg_filter = (Node *) make_column_ref(fc_info->filter_name);
+
+		tlist = lappend(tlist, create_restarget_with_val((Node *) fc_count));
+		alias = lappend(alias, fc_info->row_number_name);
+	}
+
+	row_number_stmt->targetList = tlist;
+	row_number_stmt->fromClause = list_make1(makeRangeVar(NULL, base_cte->ctename, -1));
+
+	/* FIXME: use a better name policy later */
+	cte->ctename = "row_number_cte";
+	cte->location = -1;
+	cte->aliascolnames = alias;
+	cte->ctequery = (Node *) row_number_stmt;
+
+	return cte;
 }
