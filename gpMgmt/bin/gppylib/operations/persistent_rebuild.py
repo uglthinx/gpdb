@@ -1403,7 +1403,7 @@ class RebuildPersistentTables(Operation):
             """
             After we have created the backup copies with timestamp, we save the restore information
             """
-            logger.info('Dumpping restore information of global and per database persistent table files')
+            logger.info('Dumping restore information of global and per database persistent table files')
             self.dump_restore_info()
         except Exception as e:
             if not self.backup:
@@ -1463,6 +1463,7 @@ class RebuildPersistentTables(Operation):
         else:
             logger.info('Completed rebuild of persistent tables')
             logger.info('To verify, run: $GPHOME/bin/lib/gpcheckcat -R persistent -A')
+            logger.info('When recovering the mirror for this segment, run full recovery with $GPHOME/bin/gprecoverseg -F')
 
     def dump_gpperfmon_guc(self):
         """
