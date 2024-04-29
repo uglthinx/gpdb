@@ -1514,7 +1514,7 @@ make_pathkeys_for_groupclause_recurse(pathkeys_for_groupclause_context *cxt,
 				 * The pathkey becomes a one-element sublist. canonicalize_pathkeys() might
 				 * replace it with a longer sublist later.
 				 */
-				if (!cxt->canonicalize || !pathkey_is_redundant(pathkey, cxt->result))
+				if (!cxt->canonicalize)// || !pathkey_is_redundant(pathkey, cxt->result))
 					cxt->result = lappend(cxt->result, pathkey);
 				cxt->used_refs = bms_add_member(cxt->used_refs, sortcl->tleSortGroupRef);
 			}
